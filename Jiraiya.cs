@@ -14,7 +14,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -49,10 +48,12 @@ class Program
     static bool _winPressed;
     static bool _shiftPressed;
     static bool _altPressed;
+    static bool _altComboInjected;
     static bool _suppressMoveEvents;
     static readonly HashSet<int> _swallowedKeys = new();
     static readonly HashSet<IntPtr> _programmaticMoveWindows = new();
     static IntPtr _draggingWindow = IntPtr.Zero;
+    static int _activeWinKeyCode;
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -74,6 +75,11 @@ class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
         Console.WriteLine("Jiraiya - All monitors spiral grid\n");
+
+        if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        {
+            Console.WriteLine("[!] SetProcessDpiAwarenessContext failed; coordinate scaling may be incorrect.");
+        }
 
         if (!DiscoverAllMonitors())
         {
@@ -131,7 +137,7 @@ class Program
         };
 
         // Use proper Windows message loop instead of Thread.Sleep
-        Application.SetHighDpiMode(HighDpiMode.SystemAware);
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         
         // Create invisible form to handle message loop
@@ -593,19 +599,11 @@ class Program
 
     static uint GetFocusBorderArgb()
     {
-        Color accent = Color.FromArgb(unchecked((int)_accentArgb));
-        Color softened = MixColors(accent, Color.White, 0.28);
-        if (accent.R > accent.B + 40)
+        uint argb = _accentArgb;
+        if ((argb & 0xFF000000) == 0)
         {
-            // bias warm accents slightly toward a calmer blue glow
-            Color coolRef = Color.FromArgb(unchecked((int)0xFF2D7CFF));
-            softened = MixColors(softened, coolRef, 0.30);
+            argb |= 0xFF000000;
         }
-        Color enriched = MixColors(softened, accent, 0.18);
-        uint argb = 0xFF000000;
-        argb |= (uint)(enriched.R << 16);
-        argb |= (uint)(enriched.G << 8);
-        argb |= enriched.B;
         return argb;
     }
 
@@ -615,15 +613,6 @@ class Program
         byte g = (byte)((argb >> 8) & 0xFF);
         byte b = (byte)(argb & 0xFF);
         return b | (g << 8) | (r << 16);
-    }
-
-    static Color MixColors(Color baseColor, Color blend, double amount)
-    {
-        amount = Math.Clamp(amount, 0d, 1d);
-        int r = (int)(baseColor.R * (1 - amount) + blend.R * amount);
-        int g = (int)(baseColor.G * (1 - amount) + blend.G * amount);
-        int b = (int)(baseColor.B * (1 - amount) + blend.B * amount);
-        return Color.FromArgb(255, Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(b, 0, 255));
     }
 
     static void InstallKeyboardHook()
@@ -655,6 +644,8 @@ class Program
         }
         _keyboardProc = null;
         _winPressed = _shiftPressed = _altPressed = false;
+        _altComboInjected = false;
+        _activeWinKeyCode = 0;
         _swallowedKeys.Clear();
     }
 
@@ -676,6 +667,7 @@ class Program
                     case Keys.LWin:
                     case Keys.RWin:
                         _winPressed = true;
+                        _activeWinKeyCode = info.vkCode;
                         break;
                     case Keys.LShiftKey:
                     case Keys.RShiftKey:
@@ -685,12 +677,24 @@ class Program
                     case Keys.RMenu:
                     case Keys.Menu:
                         _altPressed = true;
+                        _altComboInjected = false;
                         break;
                 }
 
                 if (_winPressed && _altPressed && key == Keys.J)
                 {
                     ToggleActive();
+                    _swallowedKeys.Add(info.vkCode);
+                    return (IntPtr)1;
+                }
+
+                if (_altPressed && key == Keys.Tab)
+                {
+                    bool backwards = _shiftPressed;
+                    Direction direction = backwards ? Direction.Left : Direction.Right;
+                    IntPtr monitor = GetMonitorUnderCursor();
+                    HandleFocusCycle(direction, monitor);
+                    EnsureAltComboFocus();
                     _swallowedKeys.Add(info.vkCode);
                     return (IntPtr)1;
                 }
@@ -711,6 +715,7 @@ class Program
                     case Keys.LWin:
                     case Keys.RWin:
                         _winPressed = false;
+                        _activeWinKeyCode = 0;
                         break;
                     case Keys.LShiftKey:
                     case Keys.RShiftKey:
@@ -720,6 +725,7 @@ class Program
                     case Keys.RMenu:
                     case Keys.Menu:
                         _altPressed = false;
+                        _altComboInjected = false;
                         break;
                 }
 
@@ -744,6 +750,62 @@ class Program
         Keys.Down => Direction.Down,
         _ => Direction.Left
     };
+
+    static void EnsureAltComboFocus()
+    {
+        if (_altComboInjected) return;
+        if (InjectCtrlTap())
+        {
+            _altComboInjected = true;
+        }
+    }
+
+    static bool InjectCtrlTap()
+    {
+        INPUT[] inputs = new INPUT[2];
+
+        inputs[0] = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            U = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = VK_CONTROL,
+                    wScan = 0,
+                    dwFlags = 0,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        inputs[1] = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            U = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = VK_CONTROL,
+                    wScan = 0,
+                    dwFlags = KEYEVENTF_KEYUP,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        if (sent != inputs.Length)
+        {
+            int error = Marshal.GetLastWin32Error();
+            Console.WriteLine($"[!] SendInput nije uspio (err={error}).");
+            return false;
+        }
+
+        return true;
+    }
 
     static void HandleForegroundChanged(IntPtr hwnd)
     {
@@ -777,44 +839,76 @@ class Program
         if (monitor == IntPtr.Zero) return;
 
         EnsureMonitorStructures(monitor);
+
+        var wins = GetOrderedWindowsForMonitor(monitor);
+        if (wins.Count > 0)
+        {
+            int sourceIndex = wins.IndexOf(hwnd);
+            if (sourceIndex != -1)
+            {
+                int logicalSlotCount = wins.Count switch
+                {
+                    <= 1 => 1,
+                    2 => 2,
+                    _ => 3
+                };
+
+                string label = GetSlotLabel(logicalSlotCount, sourceIndex);
+                Console.WriteLine($"[drag] start slot={label}");
+            }
+        }
+
         _draggingWindow = hwnd;
     }
 
     static void HandleMoveSizeEnd(IntPtr hwnd)
     {
-        if (_programmaticMoveWindows.Remove(hwnd))
-        {
-            _draggingWindow = IntPtr.Zero;
-            return;
-        }
-        if (hwnd == IntPtr.Zero) return;
+        // if (_programmaticMoveWindows.Remove(hwnd))
+        // {
+        //     _draggingWindow = IntPtr.Zero;
+        //     return;
+        // }
+        // if (hwnd == IntPtr.Zero) return;
 
         var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if (monitor == IntPtr.Zero) return;
+        // if (monitor == IntPtr.Zero) return;
 
-        EnsureMonitorStructures(monitor);
+        // EnsureMonitorStructures(monitor);
 
-        if (_draggingWindow != IntPtr.Zero && _draggingWindow != hwnd)
-        {
-            _draggingWindow = IntPtr.Zero;
-            return;
-        }
+        // if (_draggingWindow != IntPtr.Zero && _draggingWindow != hwnd)
+        // {
+        //     _draggingWindow = IntPtr.Zero;
+        //     return;
+        // }
 
-        _draggingWindow = IntPtr.Zero;
+        // _draggingWindow = IntPtr.Zero;
 
-        if (_suppressMoveEvents) return;
+        // if (_suppressMoveEvents) return;
 
-        ScanAllCandidates();
+        // ScanAllCandidates();
 
-        if (!_isActive) return;
-        if (!IsWindowValidForLayout(hwnd)) return;
-        if (!GetWindowRect(hwnd, out RECT windowRect)) return;
+        // if (!_isActive) return;
+        // if (!IsWindowValidForLayout(hwnd)) return;
 
         var workArea = EnsureMonitorWorkArea(monitor);
         if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) return;
 
-        int candidateCount = _candidatesPerMonitor.TryGetValue(monitor, out var candidateSet) ? candidateSet.Count : 0;
-        int logicalSlotCount = candidateCount switch
+        var wins = GetOrderedWindowsForMonitor(monitor);
+        if (wins.Count == 0)
+        {
+            return;
+        }
+
+        int sourceIndex = wins.IndexOf(hwnd);
+        bool addedToList = false;
+        if (sourceIndex == -1)
+        {
+            wins.Add(hwnd);
+            sourceIndex = wins.Count - 1;
+            addedToList = true;
+        }
+
+        int logicalSlotCount = wins.Count switch
         {
             <= 1 => 1,
             2 => 2,
@@ -822,8 +916,9 @@ class Program
         };
 
         POINT cursor;
-        if (!GetCursorPos(out cursor))
+        if (!TryGetCursorPoint(out cursor))
         {
+            if (!GetWindowRect(hwnd, out RECT windowRect)) return;
             cursor = new POINT
             {
                 X = windowRect.left + ((windowRect.right - windowRect.left) / 2),
@@ -832,7 +927,28 @@ class Program
         }
 
         int targetSlot = DetermineSlotFromPoint(workArea, cursor, logicalSlotCount);
-        MoveWindowToSlot(monitor, hwnd, targetSlot);
+        int targetIndex = GetTargetIndexForSlot(wins.Count, targetSlot);
+        Console.WriteLine($"[drag] drop slot={GetSlotLabel(logicalSlotCount, targetSlot)}");
+        if (targetIndex < 0 || targetIndex >= wins.Count)
+        {
+            return;
+        }
+
+        if (targetIndex == sourceIndex)
+        {
+            if (addedToList)
+            {
+                _orderedPerMonitor[monitor] = wins;
+            }
+            ApplyLayoutForMonitor(monitor);
+            FocusWindowOnMonitor(hwnd);
+            return;
+        }
+
+        (wins[sourceIndex], wins[targetIndex]) = (wins[targetIndex], wins[sourceIndex]);
+        _orderedPerMonitor[monitor] = wins;
+        ApplyLayoutForMonitor(monitor);
+        FocusWindowOnMonitor(hwnd);
     }
 
     static void EnsureMonitorStructures(IntPtr monitor)
@@ -908,7 +1024,7 @@ class Program
         return 2;
     }
 
-    static void MoveWindowToSlot(IntPtr monitor, IntPtr hwnd, int slotIndex)
+    static List<IntPtr> GetOrderedWindowsForMonitor(IntPtr monitor)
     {
         EnsureMonitorStructures(monitor);
 
@@ -917,6 +1033,84 @@ class Program
             existingOrder = new List<IntPtr>();
         }
 
+        var sanitized = new List<IntPtr>();
+        foreach (var window in existingOrder)
+        {
+            if (window == IntPtr.Zero) continue;
+            if (!IsWindow(window)) continue;
+            if (MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) != monitor) continue;
+
+            bool valid = IsWindowValidForLayout(window);
+            if (!valid && !IsWindowFullscreenOnMonitor(window, monitor))
+            {
+                continue;
+            }
+
+            if (!sanitized.Contains(window))
+            {
+                sanitized.Add(window);
+            }
+        }
+
+        if (_candidatesPerMonitor.TryGetValue(monitor, out var candidates))
+        {
+            foreach (var candidate in candidates.ToList())
+            {
+                if (!IsWindowValidForLayout(candidate)) continue;
+                if (MonitorFromWindow(candidate, MONITOR_DEFAULTTONEAREST) != monitor) continue;
+                if (!sanitized.Contains(candidate))
+                {
+                    sanitized.Add(candidate);
+                }
+            }
+        }
+
+        _orderedPerMonitor[monitor] = sanitized;
+        return sanitized;
+    }
+
+    static bool TryGetCursorPoint(out POINT point)
+    {
+        if (GetPhysicalCursorPos(out point))
+        {
+            return true;
+        }
+
+        return GetCursorPos(out point);
+    }
+
+    static IntPtr GetMonitorUnderCursor()
+    {
+        if (TryGetCursorPoint(out POINT point))
+        {
+            var monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+            if (monitor != IntPtr.Zero)
+            {
+                return monitor;
+            }
+        }
+
+        return IntPtr.Zero;
+    }
+
+    static IntPtr GetRootWindowUnderCursor()
+    {
+        if (!TryGetCursorPoint(out POINT point))
+        {
+            return IntPtr.Zero;
+        }
+
+        IntPtr window = WindowFromPoint(point);
+        if (window == IntPtr.Zero)
+        {
+            return IntPtr.Zero;
+        }
+
+        return GetAncestor(window, GA_ROOT);
+    }
+
+    static void MoveWindowToSlot(IntPtr monitor, IntPtr hwnd, int slotIndex)
+    {
         if (!_candidatesPerMonitor.TryGetValue(monitor, out var candidates))
         {
             candidates = new HashSet<IntPtr>();
@@ -925,21 +1119,7 @@ class Program
 
         candidates.Add(hwnd);
 
-        // work on a copy to avoid mutating while iterating
-        var order = existingOrder.Where(IsWindowValidForLayout)
-                                 .Where(h => MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == monitor)
-                                 .Distinct()
-                                 .ToList();
-
-        foreach (var candidate in candidates.ToList())
-        {
-            if (!IsWindowValidForLayout(candidate)) continue;
-            if (MonitorFromWindow(candidate, MONITOR_DEFAULTTONEAREST) != monitor) continue;
-            if (!order.Contains(candidate))
-            {
-                order.Add(candidate);
-            }
-        }
+        var order = GetOrderedWindowsForMonitor(monitor);
 
         if (order.Count == 0)
         {
@@ -961,11 +1141,6 @@ class Program
         else if (targetIndex != currentIndex)
         {
             (order[targetIndex], order[currentIndex]) = (order[currentIndex], order[targetIndex]);
-        }
-
-        if (!order.Contains(hwnd))
-        {
-            order.Add(hwnd);
         }
 
         _orderedPerMonitor[monitor] = order;
@@ -994,6 +1169,18 @@ class Program
         bool closeRight = Math.Abs(rect.right - monitorRect.right) <= tolerance;
         bool closeBottom = Math.Abs(rect.bottom - monitorRect.bottom) <= tolerance;
         return closeLeft && closeTop && closeRight && closeBottom;
+    }
+
+    static bool IsWindowFullscreenOnMonitor(IntPtr hwnd, IntPtr monitor)
+    {
+        if (hwnd == IntPtr.Zero || monitor == IntPtr.Zero) return false;
+        if (!IsWindow(hwnd)) return false;
+        if (!GetWindowRect(hwnd, out RECT rect)) return false;
+
+        MONITORINFO mi = new() { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(monitor, ref mi)) return false;
+
+        return IsFullscreenRect(rect, mi.rcMonitor);
     }
 
     static bool MonitorHasFullscreenWindow(IntPtr monitor)
@@ -1033,7 +1220,7 @@ class Program
     {
         if (!_isActive) return;
         IntPtr activeWindow = GetForegroundWindow();
-        if (activeWindow == IntPtr.Zero)
+        if (activeWindow == IntPtr.Zero || !IsWindowValidForLayout(activeWindow))
         {
             activeWindow = _focusedWindow;
         }
@@ -1043,12 +1230,15 @@ class Program
         var monitor = MonitorFromWindow(activeWindow, MONITOR_DEFAULTTONEAREST);
         if (monitor == IntPtr.Zero) return;
 
-        EnsureMonitorStructures(monitor);
-
-        if (!_orderedPerMonitor.TryGetValue(monitor, out var wins) || wins.Count <= 1) return;
+        var wins = GetOrderedWindowsForMonitor(monitor);
+        if (wins.Count <= 1) return;
 
         int currentIndex = wins.IndexOf(activeWindow);
-        if (currentIndex == -1) return;
+        if (currentIndex == -1)
+        {
+            FocusWindowOnMonitor(wins[0]);
+            return;
+        }
 
         GridSlot slot = GetSlotForIndex(currentIndex);
 
@@ -1112,6 +1302,87 @@ class Program
         FocusWindowOnMonitor(activeWindow);
     }
 
+    static void HandleFocusCycle(Direction direction, IntPtr monitorOverride = default)
+    {
+        IntPtr referenceWindow = GetForegroundWindow();
+        if (referenceWindow == IntPtr.Zero || !IsWindowValidForLayout(referenceWindow))
+        {
+            referenceWindow = _focusedWindow;
+        }
+
+        IntPtr monitor = monitorOverride;
+        if (monitor == IntPtr.Zero && referenceWindow != IntPtr.Zero)
+        {
+            monitor = MonitorFromWindow(referenceWindow, MONITOR_DEFAULTTONEAREST);
+        }
+
+        if (monitor == IntPtr.Zero)
+        {
+            monitor = GetMonitorUnderCursor();
+        }
+
+        if (monitor == IntPtr.Zero) return;
+
+        var wins = GetOrderedWindowsForMonitor(monitor);
+        if (wins.Count == 0) return;
+
+        int currentIndex = 0;
+
+        if (monitorOverride != IntPtr.Zero)
+        {
+            IntPtr cursorWindow = GetRootWindowUnderCursor();
+            if (cursorWindow != IntPtr.Zero && MonitorFromWindow(cursorWindow, MONITOR_DEFAULTTONEAREST) == monitor)
+            {
+                int cursorIndex = wins.IndexOf(cursorWindow);
+                if (cursorIndex != -1)
+                {
+                    currentIndex = cursorIndex;
+                }
+            }
+        }
+
+        if (currentIndex == 0 && referenceWindow != IntPtr.Zero && MonitorFromWindow(referenceWindow, MONITOR_DEFAULTTONEAREST) == monitor)
+        {
+            int refIndex = wins.IndexOf(referenceWindow);
+            if (refIndex != -1)
+            {
+                currentIndex = refIndex;
+            }
+        }
+
+        if (currentIndex == 0 && _focusedWindow != IntPtr.Zero && MonitorFromWindow(_focusedWindow, MONITOR_DEFAULTTONEAREST) == monitor)
+        {
+            int focusedIndex = wins.IndexOf(_focusedWindow);
+            if (focusedIndex != -1)
+            {
+                currentIndex = focusedIndex;
+            }
+        }
+
+        if (wins.Count == 1)
+        {
+            FocusWindowOnMonitor(wins[currentIndex]);
+            return;
+        }
+
+        int targetIndex = currentIndex;
+        if (direction is Direction.Left or Direction.Up)
+        {
+            targetIndex = (currentIndex - 1 + wins.Count) % wins.Count;
+        }
+        else if (direction is Direction.Right or Direction.Down)
+        {
+            targetIndex = (currentIndex + 1) % wins.Count;
+        }
+
+        if (targetIndex == currentIndex) return;
+
+        IntPtr target = wins[targetIndex];
+        if (!IsWindowValidForLayout(target)) return;
+
+        FocusWindowOnMonitor(target);
+    }
+
     static GridSlot GetSlotForIndex(int index) => index switch
     {
         0 => GridSlot.A,
@@ -1162,7 +1433,7 @@ class Program
 
         uint accent = GetFocusBorderArgb();
         int color = ArgbToBgr(accent);
-        int width = 6;
+        int width = 4;
         _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, ref color, sizeof(int));
         _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_WIDTH, ref width, sizeof(int));
     }
@@ -1278,6 +1549,8 @@ class Program
     const uint SWP_NOACTIVATE = 0x0010;
     const uint SWP_FRAMECHANGED = 0x0020;
 
+    const uint GA_ROOT = 2;
+
     const int SW_SHOWNORMAL = 1;
 
     const int WM_KEYDOWN = 0x0100;
@@ -1286,6 +1559,12 @@ class Program
     const int WM_SYSKEYUP = 0x0105;
 
     const int WH_KEYBOARD_LL = 13;
+
+    const uint INPUT_KEYBOARD = 1;
+    const uint KEYEVENTF_KEYUP = 0x0002;
+    const ushort VK_CONTROL = 0x11;
+
+    static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new(-4);
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -1304,11 +1583,17 @@ class Program
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] static extern bool GetPhysicalCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
 
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)] static extern IntPtr GetModuleHandle(string lpModuleName);
 
@@ -1359,6 +1644,50 @@ class Program
         public int flags;
         public int time;
         public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT
+    {
+        public uint type;
+        public InputUnion U;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    struct InputUnion
+    {
+        [FieldOffset(0)] public KEYBDINPUT ki;
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public HARDWAREINPUT hi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct HARDWAREINPUT
+    {
+        public uint uMsg;
+        public ushort wParamL;
+        public ushort wParamH;
     }
 
     [StructLayout(LayoutKind.Sequential)]
