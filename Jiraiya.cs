@@ -14,7 +14,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -49,10 +48,12 @@ class Program
     static bool _winPressed;
     static bool _shiftPressed;
     static bool _altPressed;
+    static bool _tabPressed;
     static bool _suppressMoveEvents;
     static readonly HashSet<int> _swallowedKeys = new();
     static readonly HashSet<IntPtr> _programmaticMoveWindows = new();
     static IntPtr _draggingWindow = IntPtr.Zero;
+    static int _activeWinKeyCode;
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -593,19 +594,11 @@ class Program
 
     static uint GetFocusBorderArgb()
     {
-        Color accent = Color.FromArgb(unchecked((int)_accentArgb));
-        Color softened = MixColors(accent, Color.White, 0.28);
-        if (accent.R > accent.B + 40)
+        uint argb = _accentArgb;
+        if ((argb & 0xFF000000) == 0)
         {
-            // bias warm accents slightly toward a calmer blue glow
-            Color coolRef = Color.FromArgb(unchecked((int)0xFF2D7CFF));
-            softened = MixColors(softened, coolRef, 0.30);
+            argb |= 0xFF000000;
         }
-        Color enriched = MixColors(softened, accent, 0.18);
-        uint argb = 0xFF000000;
-        argb |= (uint)(enriched.R << 16);
-        argb |= (uint)(enriched.G << 8);
-        argb |= enriched.B;
         return argb;
     }
 
@@ -615,15 +608,6 @@ class Program
         byte g = (byte)((argb >> 8) & 0xFF);
         byte b = (byte)(argb & 0xFF);
         return b | (g << 8) | (r << 16);
-    }
-
-    static Color MixColors(Color baseColor, Color blend, double amount)
-    {
-        amount = Math.Clamp(amount, 0d, 1d);
-        int r = (int)(baseColor.R * (1 - amount) + blend.R * amount);
-        int g = (int)(baseColor.G * (1 - amount) + blend.G * amount);
-        int b = (int)(baseColor.B * (1 - amount) + blend.B * amount);
-        return Color.FromArgb(255, Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(b, 0, 255));
     }
 
     static void InstallKeyboardHook()
@@ -655,6 +639,8 @@ class Program
         }
         _keyboardProc = null;
         _winPressed = _shiftPressed = _altPressed = false;
+        _tabPressed = false;
+        _activeWinKeyCode = 0;
         _swallowedKeys.Clear();
     }
 
@@ -676,6 +662,7 @@ class Program
                     case Keys.LWin:
                     case Keys.RWin:
                         _winPressed = true;
+                        _activeWinKeyCode = info.vkCode;
                         break;
                     case Keys.LShiftKey:
                     case Keys.RShiftKey:
@@ -686,11 +673,32 @@ class Program
                     case Keys.Menu:
                         _altPressed = true;
                         break;
+                    case Keys.Tab:
+                        if (_winPressed)
+                        {
+                            _tabPressed = true;
+                            _swallowedKeys.Add(info.vkCode);
+                            if (_activeWinKeyCode != 0)
+                            {
+                                _swallowedKeys.Add(_activeWinKeyCode);
+                            }
+                            return (IntPtr)1;
+                        }
+                        _tabPressed = false;
+                        break;
                 }
 
                 if (_winPressed && _altPressed && key == Keys.J)
                 {
                     ToggleActive();
+                    _swallowedKeys.Add(info.vkCode);
+                    return (IntPtr)1;
+                }
+
+                if (_winPressed && _tabPressed && IsArrowKey(key))
+                {
+                    Direction direction = DirectionFromKey(key);
+                    HandleFocusCycle(direction);
                     _swallowedKeys.Add(info.vkCode);
                     return (IntPtr)1;
                 }
@@ -711,6 +719,8 @@ class Program
                     case Keys.LWin:
                     case Keys.RWin:
                         _winPressed = false;
+                        _tabPressed = false;
+                        _activeWinKeyCode = 0;
                         break;
                     case Keys.LShiftKey:
                     case Keys.RShiftKey:
@@ -720,6 +730,9 @@ class Program
                     case Keys.RMenu:
                     case Keys.Menu:
                         _altPressed = false;
+                        break;
+                    case Keys.Tab:
+                        _tabPressed = false;
                         break;
                 }
 
@@ -831,6 +844,11 @@ class Program
             };
         }
 
+        if (TrySwapWindows(monitor, hwnd, cursor))
+        {
+            return;
+        }
+
         int targetSlot = DetermineSlotFromPoint(workArea, cursor, logicalSlotCount);
         MoveWindowToSlot(monitor, hwnd, targetSlot);
     }
@@ -908,7 +926,7 @@ class Program
         return 2;
     }
 
-    static void MoveWindowToSlot(IntPtr monitor, IntPtr hwnd, int slotIndex)
+    static List<IntPtr> GetOrderedWindowsForMonitor(IntPtr monitor)
     {
         EnsureMonitorStructures(monitor);
 
@@ -917,6 +935,44 @@ class Program
             existingOrder = new List<IntPtr>();
         }
 
+        var sanitized = new List<IntPtr>();
+        foreach (var window in existingOrder)
+        {
+            if (window == IntPtr.Zero) continue;
+            if (!IsWindow(window)) continue;
+            if (MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) != monitor) continue;
+
+            bool valid = IsWindowValidForLayout(window);
+            if (!valid && !IsWindowFullscreenOnMonitor(window, monitor))
+            {
+                continue;
+            }
+
+            if (!sanitized.Contains(window))
+            {
+                sanitized.Add(window);
+            }
+        }
+
+        if (_candidatesPerMonitor.TryGetValue(monitor, out var candidates))
+        {
+            foreach (var candidate in candidates.ToList())
+            {
+                if (!IsWindowValidForLayout(candidate)) continue;
+                if (MonitorFromWindow(candidate, MONITOR_DEFAULTTONEAREST) != monitor) continue;
+                if (!sanitized.Contains(candidate))
+                {
+                    sanitized.Add(candidate);
+                }
+            }
+        }
+
+        _orderedPerMonitor[monitor] = sanitized;
+        return sanitized;
+    }
+
+    static void MoveWindowToSlot(IntPtr monitor, IntPtr hwnd, int slotIndex)
+    {
         if (!_candidatesPerMonitor.TryGetValue(monitor, out var candidates))
         {
             candidates = new HashSet<IntPtr>();
@@ -925,21 +981,7 @@ class Program
 
         candidates.Add(hwnd);
 
-        // work on a copy to avoid mutating while iterating
-        var order = existingOrder.Where(IsWindowValidForLayout)
-                                 .Where(h => MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == monitor)
-                                 .Distinct()
-                                 .ToList();
-
-        foreach (var candidate in candidates.ToList())
-        {
-            if (!IsWindowValidForLayout(candidate)) continue;
-            if (MonitorFromWindow(candidate, MONITOR_DEFAULTTONEAREST) != monitor) continue;
-            if (!order.Contains(candidate))
-            {
-                order.Add(candidate);
-            }
-        }
+        var order = GetOrderedWindowsForMonitor(monitor);
 
         if (order.Count == 0)
         {
@@ -963,14 +1005,60 @@ class Program
             (order[targetIndex], order[currentIndex]) = (order[currentIndex], order[targetIndex]);
         }
 
-        if (!order.Contains(hwnd))
-        {
-            order.Add(hwnd);
-        }
-
         _orderedPerMonitor[monitor] = order;
         ApplyLayoutForMonitor(monitor);
         UpdateFocusHighlight(hwnd);
+    }
+
+    static IntPtr GetRootWindowAtPoint(POINT point)
+    {
+        IntPtr candidate = WindowFromPoint(point);
+        if (candidate == IntPtr.Zero) return IntPtr.Zero;
+
+        IntPtr root = GetAncestor(candidate, GA_ROOT);
+        return root != IntPtr.Zero ? root : candidate;
+    }
+
+    static bool TrySwapWindows(IntPtr monitor, IntPtr source, POINT dropPoint)
+    {
+        if (!_candidatesPerMonitor.TryGetValue(monitor, out var candidates))
+        {
+            candidates = new HashSet<IntPtr>();
+            _candidatesPerMonitor[monitor] = candidates;
+        }
+
+        IntPtr target = GetRootWindowAtPoint(dropPoint);
+        if (target == IntPtr.Zero || target == source) return false;
+        if (!IsWindowValidForLayout(target)) return false;
+        if (MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST) != monitor) return false;
+
+        candidates.Add(source);
+        candidates.Add(target);
+
+        var order = GetOrderedWindowsForMonitor(monitor);
+        if (order.Count == 0) return false;
+
+        int sourceIndex = order.IndexOf(source);
+        if (sourceIndex == -1)
+        {
+            order.Add(source);
+            sourceIndex = order.Count - 1;
+        }
+
+        int targetIndex = order.IndexOf(target);
+        if (targetIndex == -1)
+        {
+            order.Add(target);
+            targetIndex = order.Count - 1;
+        }
+
+        if (sourceIndex == targetIndex) return false;
+
+        (order[sourceIndex], order[targetIndex]) = (order[targetIndex], order[sourceIndex]);
+        _orderedPerMonitor[monitor] = order;
+        ApplyLayoutForMonitor(monitor);
+        UpdateFocusHighlight(source);
+        return true;
     }
 
     static int GetTargetIndexForSlot(int count, int slotIndex)
@@ -994,6 +1082,18 @@ class Program
         bool closeRight = Math.Abs(rect.right - monitorRect.right) <= tolerance;
         bool closeBottom = Math.Abs(rect.bottom - monitorRect.bottom) <= tolerance;
         return closeLeft && closeTop && closeRight && closeBottom;
+    }
+
+    static bool IsWindowFullscreenOnMonitor(IntPtr hwnd, IntPtr monitor)
+    {
+        if (hwnd == IntPtr.Zero || monitor == IntPtr.Zero) return false;
+        if (!IsWindow(hwnd)) return false;
+        if (!GetWindowRect(hwnd, out RECT rect)) return false;
+
+        MONITORINFO mi = new() { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(monitor, ref mi)) return false;
+
+        return IsFullscreenRect(rect, mi.rcMonitor);
     }
 
     static bool MonitorHasFullscreenWindow(IntPtr monitor)
@@ -1033,7 +1133,7 @@ class Program
     {
         if (!_isActive) return;
         IntPtr activeWindow = GetForegroundWindow();
-        if (activeWindow == IntPtr.Zero)
+        if (activeWindow == IntPtr.Zero || !IsWindowValidForLayout(activeWindow))
         {
             activeWindow = _focusedWindow;
         }
@@ -1043,12 +1143,15 @@ class Program
         var monitor = MonitorFromWindow(activeWindow, MONITOR_DEFAULTTONEAREST);
         if (monitor == IntPtr.Zero) return;
 
-        EnsureMonitorStructures(monitor);
-
-        if (!_orderedPerMonitor.TryGetValue(monitor, out var wins) || wins.Count <= 1) return;
+        var wins = GetOrderedWindowsForMonitor(monitor);
+        if (wins.Count <= 1) return;
 
         int currentIndex = wins.IndexOf(activeWindow);
-        if (currentIndex == -1) return;
+        if (currentIndex == -1)
+        {
+            FocusWindowOnMonitor(wins[0]);
+            return;
+        }
 
         GridSlot slot = GetSlotForIndex(currentIndex);
 
@@ -1112,6 +1215,52 @@ class Program
         FocusWindowOnMonitor(activeWindow);
     }
 
+    static void HandleFocusCycle(Direction direction)
+    {
+        IntPtr referenceWindow = GetForegroundWindow();
+        if (referenceWindow == IntPtr.Zero || !IsWindowValidForLayout(referenceWindow))
+        {
+            referenceWindow = _focusedWindow;
+        }
+
+        if (referenceWindow == IntPtr.Zero) return;
+
+        var monitor = MonitorFromWindow(referenceWindow, MONITOR_DEFAULTTONEAREST);
+        if (monitor == IntPtr.Zero) return;
+
+        var wins = GetOrderedWindowsForMonitor(monitor);
+        if (wins.Count == 0) return;
+
+        int currentIndex = wins.IndexOf(referenceWindow);
+        if (currentIndex == -1)
+        {
+            currentIndex = 0;
+        }
+
+        if (wins.Count == 1)
+        {
+            FocusWindowOnMonitor(wins[currentIndex]);
+            return;
+        }
+
+        int targetIndex = currentIndex;
+        if (direction is Direction.Left or Direction.Up)
+        {
+            targetIndex = (currentIndex - 1 + wins.Count) % wins.Count;
+        }
+        else if (direction is Direction.Right or Direction.Down)
+        {
+            targetIndex = (currentIndex + 1) % wins.Count;
+        }
+
+        if (targetIndex == currentIndex) return;
+
+        IntPtr target = wins[targetIndex];
+        if (!IsWindowValidForLayout(target)) return;
+
+        FocusWindowOnMonitor(target);
+    }
+
     static GridSlot GetSlotForIndex(int index) => index switch
     {
         0 => GridSlot.A,
@@ -1162,7 +1311,7 @@ class Program
 
         uint accent = GetFocusBorderArgb();
         int color = ArgbToBgr(accent);
-        int width = 6;
+        int width = 4;
         _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, ref color, sizeof(int));
         _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_WIDTH, ref width, sizeof(int));
     }
@@ -1278,6 +1427,8 @@ class Program
     const uint SWP_NOACTIVATE = 0x0010;
     const uint SWP_FRAMECHANGED = 0x0020;
 
+    const uint GA_ROOT = 2;
+
     const int SW_SHOWNORMAL = 1;
 
     const int WM_KEYDOWN = 0x0100;
@@ -1305,6 +1456,8 @@ class Program
 
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
 
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
