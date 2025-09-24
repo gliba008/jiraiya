@@ -14,6 +14,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -54,6 +55,7 @@ class Program
     static readonly HashSet<IntPtr> _programmaticMoveWindows = new();
     static IntPtr _draggingWindow = IntPtr.Zero;
     static int _activeWinKeyCode;
+    static NotifyIcon? _notifyIcon;
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -126,6 +128,7 @@ class Program
             e.Cancel = true;
             Console.WriteLine("\n[i] Shutting down...");
             CleanupHooks();
+            DisposeNotifyIcon();
             if (_hiddenForm != null)
             {
                 _hiddenForm.Invoke(new Action(() => Application.Exit()));
@@ -147,6 +150,7 @@ class Program
             ShowInTaskbar = false,
             Visible = false
         };
+        _hiddenForm.FormClosed += (_, __) => DisposeNotifyIcon();
         
         GC.KeepAlive(_cb); // drži delegata živim
         Application.Run(_hiddenForm);
@@ -581,11 +585,13 @@ class Program
             ScanAllCandidates();
             ApplyAllLayouts();
             ReapplyFocusHighlight();
+            ShowStatusNotification("Jiraiya", "Upaljen.");
         }
         else
         {
             Console.WriteLine("[i] Jiraiya pauziran (Win+Alt+J)");
             ClearFocusHighlight();
+            ShowStatusNotification("Jiraiya", "Zaustavljen.");
         }
     }
 
@@ -613,6 +619,56 @@ class Program
         byte g = (byte)((argb >> 8) & 0xFF);
         byte b = (byte)(argb & 0xFF);
         return b | (g << 8) | (r << 16);
+    }
+
+    static void ShowStatusNotification(string title, string message)
+    {
+        if (_hiddenForm != null && _hiddenForm.InvokeRequired)
+        {
+            _hiddenForm.BeginInvoke(new Action(() => ShowNotificationInternal(title, message)));
+        }
+        else
+        {
+            ShowNotificationInternal(title, message);
+        }
+    }
+
+    static void ShowNotificationInternal(string title, string message)
+    {
+        EnsureNotifyIcon();
+        if (_notifyIcon == null) return;
+
+        _notifyIcon.BalloonTipTitle = title;
+        _notifyIcon.BalloonTipText = message;
+        _notifyIcon.ShowBalloonTip(3000);
+    }
+
+    static void EnsureNotifyIcon()
+    {
+        if (_notifyIcon != null) return;
+
+        _notifyIcon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Visible = true,
+            Text = "Jiraiya",
+            BalloonTipIcon = ToolTipIcon.Info
+        };
+    }
+
+    static void DisposeNotifyIcon()
+    {
+        if (_notifyIcon == null) return;
+
+        try
+        {
+            _notifyIcon.Visible = false;
+            _notifyIcon.Dispose();
+        }
+        finally
+        {
+            _notifyIcon = null;
+        }
     }
 
     static void InstallKeyboardHook()
@@ -688,7 +744,7 @@ class Program
                     return (IntPtr)1;
                 }
 
-                if (_altPressed && key == Keys.Tab)
+                if (_isActive && _altPressed && key == Keys.Tab)
                 {
                     bool backwards = _shiftPressed;
                     Direction direction = backwards ? Direction.Left : Direction.Right;
@@ -832,6 +888,11 @@ class Program
             _draggingWindow = IntPtr.Zero;
             return;
         }
+        if (!_isActive)
+        {
+            _draggingWindow = IntPtr.Zero;
+            return;
+        }
         if (_suppressMoveEvents || hwnd == IntPtr.Zero) return;
         if (!IsWindow(hwnd)) return;
 
@@ -863,6 +924,11 @@ class Program
 
     static void HandleMoveSizeEnd(IntPtr hwnd)
     {
+        if (!_isActive)
+        {
+            _draggingWindow = IntPtr.Zero;
+            return;
+        }
         // if (_programmaticMoveWindows.Remove(hwnd))
         // {
         //     _draggingWindow = IntPtr.Zero;
