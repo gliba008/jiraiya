@@ -1,5 +1,7 @@
 {
-  "ignore_apps": [],
+  "ignore_apps": [
+    "C:\\Users\\gliba\\AppData\\Local\\Microsoft\\WindowsApps\\Spotify.exe"
+  ],
   "ignore_dialogs": true,
   "center_ignored_windows": true,
   "debounce_in_ms": 120

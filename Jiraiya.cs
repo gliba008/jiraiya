@@ -25,6 +25,7 @@ using System.Text.Json.Serialization;
 using System.Timers;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using System.Reflection;
 
 class Program
 {
@@ -61,11 +62,16 @@ class Program
     static int _activeWinKeyCode;
     static Icon? _appIcon;
     static readonly string _frogIconPath = Path.Combine(AppContext.BaseDirectory, "frog.ico");
+    static readonly string _readmeUrl = "https://github.com/gliba008/jiraiya/blob/master/README.md";
     static readonly Dictionary<IntPtr, FullscreenToggleState> _fullscreenToggles = new();
     static AppConfiguration _config = null!;
     static readonly HashSet<IntPtr> _ignoredWindows = new();
     static readonly HashSet<IntPtr> _centeredIgnoredWindows = new();
     static readonly Dictionary<uint, string?> _processPathCache = new();
+    static NotifyIcon? _trayIcon;
+    static ContextMenuStrip? _trayMenu;
+    static ToolStripMenuItem? _toggleMenuItem;
+    static string _configPath = string.Empty;
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -164,7 +170,7 @@ class Program
 
     static void Main()
     {
-        Console.OutputEncoding = Encoding.UTF8;
+        TryEnableConsoleUtf8();
         Console.WriteLine("Jiraiya - multi-monitor window tiling\n");
 
         try
@@ -175,8 +181,7 @@ class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[!] Configuration error: " + ex.Message);
-            Environment.Exit(1);
+            ShowFatalStartupError("Configuration error:\n" + ex.Message);
             return;
         }
 
@@ -189,7 +194,7 @@ class Program
 
         if (!DiscoverAllMonitors())
         {
-            Console.WriteLine("[!] No monitors detected. Exiting.");
+            ShowFatalStartupError("No monitors detected. Exiting.");
             return;
         }
 
@@ -224,29 +229,16 @@ class Program
             Console.WriteLine("[!] At least one hook failed to register (IntPtr.Zero). Check signatures and UAC.");
         }
 
-        Console.WriteLine("[i] Hooks active. Press Ctrl+C to exit.");
-
-        // Setup console cancel handler for clean shutdown
-        Console.CancelKeyPress += (sender, e) =>
-        {
-            e.Cancel = true;
-            Console.WriteLine("\n[i] Shutting down...");
-            CleanupHooks();
-            DisposeAppIcon();
-            if (_hiddenForm != null)
-            {
-                _hiddenForm.Invoke(new Action(() => Application.Exit()));
-            }
-            else
-            {
-                Application.Exit();
-            }
-        };
-
-        // Use proper Windows message loop instead of Thread.Sleep
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
-        
+
+        Application.ApplicationExit += (_, __) =>
+        {
+            CleanupHooks();
+            DisposeTrayIcon();
+            DisposeAppIcon();
+        };
+
         // Create invisible form to handle message loop
         _hiddenForm = new Form()
         {
@@ -258,8 +250,9 @@ class Program
         {
             _hiddenForm.Icon = _appIcon;
         }
-        _hiddenForm.FormClosed += (_, __) => DisposeAppIcon();
         _hiddenForm.Shown += (_, __) => ShowStatusToast(true);
+
+        InstallTrayIcon();
 
         GC.KeepAlive(_cb); // drži delegata živim
         Application.Run(_hiddenForm);
@@ -520,7 +513,7 @@ class Program
         var ignoreReason = GetIgnoreReason(hwnd, style, exStyle);
         if (ignoreReason != IgnoreReason.None)
         {
-            HandleIgnoredWindow(hwnd, ignoreReason);
+            HandleIgnoredWindow(hwnd, ignoreReason, style, exStyle);
             return false;
         }
 
@@ -690,9 +683,8 @@ class Program
         bool lacksMaximize = (style & WS_MAXIMIZEBOX) == 0;
         bool hasDlgFrame = (style & WS_DLGFRAME) != 0;
         bool hasCaption = (style & WS_CAPTION) != 0;
-        bool isPopup = (style & WS_POPUP) != 0;
 
-        if (hasDlgFrame && lacksResizeBorder)
+        if (hasDlgFrame && lacksResizeBorder && hasCaption)
         {
             return true;
         }
@@ -702,15 +694,10 @@ class Program
             return true;
         }
 
-        if (isPopup && lacksResizeBorder && lacksMinimize && lacksMaximize)
-        {
-            return true;
-        }
-
         return false;
     }
 
-    static void HandleIgnoredWindow(IntPtr hwnd, IgnoreReason reason)
+    static void HandleIgnoredWindow(IntPtr hwnd, IgnoreReason reason, long style, long exStyle)
     {
         bool firstObservation = _ignoredWindows.Add(hwnd);
         if (firstObservation)
@@ -718,7 +705,7 @@ class Program
             Console.WriteLine($"[ign] Skipping hwnd=0x{hwnd.ToInt64():X} reason={reason}{DescribeWindowForLogs(hwnd)}");
         }
 
-        if (_config.CenterIgnoredWindows && _centeredIgnoredWindows.Add(hwnd))
+        if (_config.CenterIgnoredWindows && ShouldCenterIgnoredWindow(reason, style, exStyle) && _centeredIgnoredWindows.Add(hwnd))
         {
             if (CenterIgnoredWindow(hwnd))
             {
@@ -729,6 +716,27 @@ class Program
                 Console.WriteLine("    ↳ centering ignored window failed");
             }
         }
+    }
+
+    static bool ShouldCenterIgnoredWindow(IgnoreReason reason, long style, long exStyle)
+    {
+        if (reason == IgnoreReason.ListedApp)
+        {
+            return true;
+        }
+
+        if (reason == IgnoreReason.Dialog)
+        {
+            const long WS_CAPTION = 0x00C00000;
+            const long WS_EX_TOOLWINDOW = 0x00000080;
+
+            bool hasCaption = (style & WS_CAPTION) != 0;
+            bool isToolWindow = (exStyle & WS_EX_TOOLWINDOW) != 0;
+
+            return hasCaption && !isToolWindow;
+        }
+
+        return false;
     }
 
     static void RemoveIgnoredTracking(IntPtr hwnd)
@@ -1061,6 +1069,8 @@ class Program
             ClearFocusHighlight();
             ShowStatusToast(false);
         }
+
+        UpdateTrayToggleText();
     }
 
     static void OnDisplaySettingsChanged(object? sender, EventArgs e)
@@ -1523,6 +1533,7 @@ class Program
     static AppConfiguration LoadConfiguration()
     {
         string configPath = LocateConfigurationPath();
+        _configPath = configPath;
 
         using FileStream stream = File.OpenRead(configPath);
         JsonSerializerOptions options = new()
@@ -1598,6 +1609,186 @@ class Program
         }
 
         return null;
+    }
+
+    static void InstallTrayIcon()
+    {
+        DisposeTrayIcon();
+
+        _trayMenu = new ContextMenuStrip();
+
+        var titleItem = new ToolStripMenuItem(GetAppTitle()) { Enabled = false }; // header label
+        _trayMenu.Items.Add(titleItem);
+        _trayMenu.Items.Add(new ToolStripSeparator());
+
+        _toggleMenuItem = new ToolStripMenuItem();
+        _toggleMenuItem.Click += (_, __) => ToggleActive();
+        _trayMenu.Items.Add(_toggleMenuItem);
+
+        var configItem = new ToolStripMenuItem("Config...");
+        configItem.Click += (_, __) => OpenConfigFile();
+        _trayMenu.Items.Add(configItem);
+
+        var readmeItem = new ToolStripMenuItem("Readme");
+        readmeItem.Click += (_, __) => OpenReadme();
+        _trayMenu.Items.Add(readmeItem);
+
+        _trayMenu.Items.Add(new ToolStripSeparator());
+
+        var exitItem = new ToolStripMenuItem("Exit");
+        exitItem.Click += (_, __) => RequestExit();
+        _trayMenu.Items.Add(exitItem);
+
+        _trayIcon = new NotifyIcon
+        {
+            Icon = _appIcon ?? SystemIcons.Application,
+            Visible = true,
+            Text = GetAppTitle(),
+            ContextMenuStrip = _trayMenu
+        };
+
+        _trayIcon.MouseUp += (_, args) =>
+        {
+            if (args.Button == MouseButtons.Left && _trayMenu != null)
+            {
+                _trayMenu.Show(Cursor.Position);
+            }
+        };
+
+        UpdateTrayToggleText();
+    }
+
+    static void UpdateTrayToggleText()
+    {
+        if (_toggleMenuItem != null)
+        {
+            string toggleText = _isActive ? "Disable tiling (Win+Alt+J)" : "Enable tiling (Win+Alt+J)";
+            _toggleMenuItem.Text = toggleText;
+        }
+
+        if (_trayIcon != null)
+        {
+            string state = _isActive ? "Enabled" : "Disabled";
+            try
+            {
+                _trayIcon.Text = $"Jiraiya ({state})";
+            }
+            catch
+            {
+                _trayIcon.Text = "Jiraiya";
+            }
+        }
+    }
+
+    static void OpenConfigFile()
+    {
+        if (string.IsNullOrEmpty(_configPath) || !File.Exists(_configPath))
+        {
+            MessageBox.Show("Active configuration file was not found.", GetAppTitle(), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = _configPath,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to open config.json:\n{ex.Message}", GetAppTitle(), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    static void OpenReadme()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = _readmeUrl,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to open README:\n{ex.Message}", GetAppTitle(), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    static void RequestExit()
+    {
+        if (_hiddenForm != null && _hiddenForm.IsHandleCreated)
+        {
+            _hiddenForm.BeginInvoke(new Action(() => Application.Exit()));
+        }
+        else
+        {
+            Application.Exit();
+        }
+    }
+
+    static void DisposeTrayIcon()
+    {
+        if (_trayIcon != null)
+        {
+            try
+            {
+                _trayIcon.Visible = false;
+            }
+            catch
+            {
+                // ignored
+            }
+            _trayIcon.Dispose();
+            _trayIcon = null;
+        }
+
+        _trayMenu?.Dispose();
+        _trayMenu = null;
+        _toggleMenuItem = null;
+    }
+
+    static string GetAppVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        string? informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(informational))
+        {
+            return informational;
+        }
+
+        return assembly.GetName().Version?.ToString() ?? "1.0.0";
+    }
+
+    static string GetAppTitle() => $"Jiraiya v{GetAppVersion()}";
+
+    static void ShowFatalStartupError(string message)
+    {
+        try
+        {
+            MessageBox.Show(message, GetAppTitle(), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        catch
+        {
+            // ignored – message box may fail if no UI thread yet
+        }
+
+        Console.WriteLine("[!] " + message.Replace('\n', ' '));
+    }
+
+    static void TryEnableConsoleUtf8()
+    {
+        try
+        {
+            Console.OutputEncoding = Encoding.UTF8;
+        }
+        catch
+        {
+            // console might not exist in WinExe mode
+        }
     }
 
     static bool IsArrowKey(Keys key) => key is Keys.Left or Keys.Right or Keys.Up or Keys.Down;
