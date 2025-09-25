@@ -59,9 +59,24 @@ class Program
     static int _activeWinKeyCode;
     static Icon? _appIcon;
     static readonly string _frogIconPath = Path.Combine(AppContext.BaseDirectory, "frog.ico");
+    static readonly Dictionary<IntPtr, FullscreenToggleState> _fullscreenToggles = new();
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
+
+    sealed class FullscreenToggleState
+    {
+        public FullscreenToggleState(IntPtr monitor, Dictionary<IntPtr, RECT> windowRects, List<IntPtr> orderedHandles)
+        {
+            Monitor = monitor;
+            WindowRects = windowRects;
+            OrderedHandles = orderedHandles;
+        }
+
+        public IntPtr Monitor { get; }
+        public Dictionary<IntPtr, RECT> WindowRects { get; }
+        public List<IntPtr> OrderedHandles { get; }
+    }
 
     // DRŽI delegata u static polju (+ pravilna konvencija poziva)
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
@@ -295,6 +310,22 @@ class Program
         foreach (var hwnd in _programmaticMoveWindows.Where(h => !seenWindows.Contains(h)).ToList())
         {
             _programmaticMoveWindows.Remove(hwnd);
+        }
+
+        foreach (var kvp in _fullscreenToggles.ToList())
+        {
+            if (!IsWindow(kvp.Key))
+            {
+                _fullscreenToggles.Remove(kvp.Key);
+                continue;
+            }
+
+            var state = kvp.Value;
+            foreach (var stale in state.WindowRects.Keys.Where(h => !IsWindow(h)).ToList())
+            {
+                state.WindowRects.Remove(stale);
+            }
+            state.OrderedHandles.RemoveAll(h => !IsWindow(h));
         }
     }
 
@@ -864,6 +895,13 @@ class Program
                     return (IntPtr)1;
                 }
 
+                if (_altPressed && key == Keys.F11)
+                {
+                    ToggleFullscreenForActiveWindow();
+                    _swallowedKeys.Add(info.vkCode);
+                    return (IntPtr)1;
+                }
+
                 if (_isActive && _altPressed && key == Keys.Tab)
                 {
                     bool backwards = _shiftPressed;
@@ -914,6 +952,145 @@ class Program
         }
 
         return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+    }
+
+    static void ToggleFullscreenForActiveWindow()
+    {
+        IntPtr hwnd = GetForegroundWindow();
+        if ((hwnd == IntPtr.Zero || !IsWindowValidForToggleTarget(hwnd)) && _focusedWindow != IntPtr.Zero)
+        {
+            hwnd = _focusedWindow;
+        }
+
+        if (!IsWindowValidForToggleTarget(hwnd))
+        {
+            return;
+        }
+
+        if (_fullscreenToggles.TryGetValue(hwnd, out var saved))
+        {
+            RestoreWindowFromToggle(hwnd, saved);
+            _fullscreenToggles.Remove(hwnd);
+
+            if (_isActive)
+            {
+                ScanAllCandidates();
+            }
+            return;
+        }
+
+        if (!GetWindowRect(hwnd, out RECT currentRect))
+        {
+            return;
+        }
+
+        IntPtr monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (monitor == IntPtr.Zero)
+        {
+            return;
+        }
+
+        MONITORINFO monitorInfo = new() { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(monitor, ref monitorInfo))
+        {
+            return;
+        }
+
+        var ordered = GetOrderedWindowsForMonitor(monitor)
+            .Where(IsWindow)
+            .Distinct()
+            .ToList();
+        if (!ordered.Contains(hwnd))
+        {
+            ordered.Add(hwnd);
+        }
+
+        var windowRects = new Dictionary<IntPtr, RECT>();
+        foreach (var win in ordered)
+        {
+            if (IsWindow(win) && GetWindowRect(win, out RECT rect))
+            {
+                windowRects[win] = rect;
+            }
+        }
+
+        if (!windowRects.ContainsKey(hwnd))
+        {
+            windowRects[hwnd] = currentRect;
+        }
+
+        _fullscreenToggles[hwnd] = new FullscreenToggleState(monitor, windowRects, ordered);
+
+        RECT fullscreenRect = monitorInfo.rcMonitor;
+        MoveWindowToRect(hwnd, fullscreenRect, "ALT+F11");
+    }
+
+    static void RestoreWindowFromToggle(IntPtr hwnd, FullscreenToggleState saved)
+    {
+        bool previousSuppress = _suppressMoveEvents;
+        _suppressMoveEvents = true;
+        try
+        {
+            foreach (var kv in saved.WindowRects)
+            {
+                IntPtr target = kv.Key;
+                if (target == hwnd) continue;
+                if (!IsWindow(target)) continue;
+                MoveWindowToRect(target, kv.Value, "ALT+F11 peer restore");
+            }
+
+            if (saved.WindowRects.TryGetValue(hwnd, out var selfRect) && IsWindow(hwnd))
+            {
+                MoveWindowToRect(hwnd, selfRect, "ALT+F11 restore");
+            }
+        }
+        finally
+        {
+            _suppressMoveEvents = previousSuppress;
+        }
+
+        if (saved.Monitor != IntPtr.Zero)
+        {
+            EnsureMonitorStructures(saved.Monitor);
+            var filteredOrder = saved.OrderedHandles
+                .Where(IsWindow)
+                .Distinct()
+                .ToList();
+            if (filteredOrder.Count > 0)
+            {
+                _orderedPerMonitor[saved.Monitor] = filteredOrder;
+            }
+        }
+
+        FocusWindowOnMonitor(hwnd);
+    }
+
+    static bool IsWindowValidForToggleTarget(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        if (!IsWindow(hwnd)) return false;
+        if (_hiddenForm != null && hwnd == _hiddenForm.Handle) return false;
+        return true;
+    }
+
+    static void MoveWindowToRect(IntPtr hwnd, RECT rect, string context)
+    {
+        if (!IsWindow(hwnd)) return;
+
+        if (GetWindowRect(hwnd, out RECT current) && AreRectsClose(current, rect))
+        {
+            return;
+        }
+
+        _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        _programmaticMoveWindows.Add(hwnd);
+        bool ok = SetWindowPos(hwnd, IntPtr.Zero, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        if (!ok)
+        {
+            _programmaticMoveWindows.Remove(hwnd);
+        }
+        Console.WriteLine($"    → {context}: {(ok ? "OK" : "FAIL")} hwnd=0x{hwnd.ToInt64():X}");
     }
 
     static bool IsArrowKey(Keys key) => key is Keys.Left or Keys.Right or Keys.Up or Keys.Down;
