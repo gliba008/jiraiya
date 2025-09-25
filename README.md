@@ -1,98 +1,24 @@
-# 🐸 The Tale of The Jiraiya the Gallant
+# 🐸 Jiraiya Window Tiling Utility
 
-*A spiraling window tiling manager for Windows*
+## Introduction
+Jiraiya is a lightweight tiling assistant for Windows inspired by David Heinemeier Hansson's Omarchy Linux setup. It works alongside the operating system instead of fighting it: no exotic shell replacements, no hidden hacks, just tidy window placement across every monitor.
 
-## ✨ Features
+## How It Works
+- Launch Jiraiya and it immediately arranges the visible application windows into its three-slot layout (A, B, C) per monitor.
+- It keeps listening for window events—new windows, closures, focus changes, moves—and reapplies the layout only when necessary.
+- Press `Win + Alt + J` at any time to pause or resume the tiler. While paused, Jiraiya stays out of the way; Windows behaves exactly as if the tool were not running.
+- The utility never overrides core Windows flows. You can still snap, resize, or move windows manually; Jiraiya simply automates the repetitive tiling work when it is enabled.
 
-- **🌀 Spiral Tiling Layout** - Intelligent window arrangement that grows in a spiral pattern
-- **⚡ Event-Driven** - No polling, responds instantly to window changes
-- **🎯 Hotkey Control** - Windows + Alt + J to toggle ON/OFF
-- **🐸 System Tray** - Minimizes to tray with frog icon
-- **📱 Smart Layout** - Adapts to 1, 2, or many windows automatically
-
-## 🏗️ Layout Algorithm
-
-### Single Window
-```
-┌─────────────────────────┐
-│                         │
-│       Window 1          │
-│      (100% width)       │
-│                         │
-└─────────────────────────┘
-```
-
-### Two Windows
-```
-┌────────────┬────────────┐
-│            │            │
-│  Window 1  │  Window 2  │
-│  (50%)     │  (50%)     │
-│            │            │
-└────────────┴────────────┘
-```
-
-### Three+ Windows (Spiral)
-```
-┌────────────┬────────────┐
-│            │  Window 2  │
-│  Window 1  ├──────┬─────┤
-│  (50%)     │ Win3 │Win4+│
-│            │      │     │
-└────────────┴──────┴─────┘
-```
-
-## 🚀 Installation
-
-1. Make sure you have .NET 6.0 installed
-2. Clone or download this repository
-3. Open terminal in project folder
-4. Run: `dotnet run`
-
-## 🎮 Usage
-
-- **Start**: Run `dotnet run` - program starts minimized in system tray
-- **Toggle**: Press `Windows + Alt + J` to enable/disable tiling
-- **View Console**: Double-click tray icon or right-click → Open
-- **Exit**: Right-click tray icon → Exit
-
-## 🐸 System Tray
-
-- **🐸 Frog Icon** - Shows in system tray
-- **Double-click** - Opens console window
-- **Right-click** - Context menu with options:
-  - 🐸 Open - Show console window
-  - ⚡ Toggle ON/OFF - Enable/disable tiling
-  - ❌ Exit - Close application
-
-## ⚙️ How It Works
-
-1. **Event Hooks** - Listens to Windows events (create, destroy, show, hide)
-2. **Smart Filtering** - Only tiles valid application windows
-3. **Spiral Algorithm** - Main window (50% left) + spiral arrangement (50% right)
-4. **Multi-Monitor** - Works with the monitor where cursor is located
-
-## 🛠️ Technical Details
-
-- **Framework**: .NET 6.0 Windows Forms
-- **API**: Windows User32 API for window management
-- **Architecture**: Event-driven with Windows hooks
-- **Performance**: Zero polling, minimal resource usage
-
-## 📋 Requirements
-
-- Windows 10/11
-- .NET 6.0 Runtime
-- Administrator privileges (for global hotkey registration)
-
-## 🤝 Contributing
-
-Feel free to submit issues and enhancement requests!
-
-## 📜 License
-
-This project is open source. Feel free to use and modify as needed.
+## Commands
+| Action | Shortcut / Interaction | Description |
+| --- | --- | --- |
+| Toggle tiling | `Win + Alt + J` | Pause or resume Jiraiya and show a tray notification. |
+| Focus next tiled window | `Alt + Tab` | Cycle forward through tiled windows on the current monitor (only while enabled). |
+| Focus previous tiled window | `Alt + Shift + Tab` | Cycle backward through tiled windows on the current monitor. |
+| Reorder window left/right | `Win + Shift + Left / Right` | Move the focused window between the left slot and the right-hand stack. |
+| Reorder window vertically | `Win + Shift + Up / Down` | Shuffle the focused window inside the right-hand stack (top ↔ bottom). |
+| Move with the mouse | Drag a window | Drop a window onto the desired slot (A, B, C) to swap positions automatically. |
+| Exit the utility | Close console or tray menu | Press `Ctrl + C` in the console window or exit via the tray icon. |
 
 ---
-
-*The tale continues... 🐸*
+Built with .NET and the Win32 API to keep your desktop orderly without breaking your Windows workflow.

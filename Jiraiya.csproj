@@ -9,6 +9,12 @@
     <AssemblyName>Jiraiya</AssemblyName>
     <Product>The Tale of The Jiraiya the Gallant</Product>
     <Version>1.0.0</Version>
+    <ApplicationIcon>frog.ico</ApplicationIcon>
   </PropertyGroup>
+  <ItemGroup>
+    <None Update="frog.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 
 </Project>
