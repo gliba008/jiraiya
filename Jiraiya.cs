@@ -15,6 +15,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -55,7 +57,8 @@ class Program
     static readonly HashSet<IntPtr> _programmaticMoveWindows = new();
     static IntPtr _draggingWindow = IntPtr.Zero;
     static int _activeWinKeyCode;
-    static NotifyIcon? _notifyIcon;
+    static Icon? _appIcon;
+    static readonly string _frogIconPath = Path.Combine(AppContext.BaseDirectory, "frog.ico");
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -76,20 +79,22 @@ class Program
     static void Main()
     {
         Console.OutputEncoding = Encoding.UTF8;
-        Console.WriteLine("Jiraiya - All monitors spiral grid\n");
+        Console.WriteLine("Jiraiya - multi-monitor window tiling\n");
 
         if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         {
             Console.WriteLine("[!] SetProcessDpiAwarenessContext failed; coordinate scaling may be incorrect.");
         }
 
+        LoadAppIcon();
+
         if (!DiscoverAllMonitors())
         {
-            Console.WriteLine("[!] Nisu pronađeni monitori. Zatvaram.");
+            Console.WriteLine("[!] No monitors detected. Exiting.");
             return;
         }
 
-        Console.WriteLine($"[i] Radim na {_allMonitors.Count} monitor(a)");
+        Console.WriteLine($"[i] Managing {_allMonitors.Count} monitor(s)");
         foreach (var mon in _allMonitors)
         {
             var work = _monitorWorkAreas[mon];
@@ -117,10 +122,10 @@ class Program
         Console.WriteLine($"[i] Hooks: show/hide=0x{_hookShowHide.ToInt64():X}, fg=0x{_hookForeground.ToInt64():X}, minmax=0x{_hookMinMax.ToInt64():X}, move=0x{_hookMoveSize.ToInt64():X}");
         if (_hookShowHide == IntPtr.Zero || _hookForeground == IntPtr.Zero || _hookMinMax == IntPtr.Zero || _hookMoveSize == IntPtr.Zero)
         {
-            Console.WriteLine("[!] Bar jedan hook nije postavljen (IntPtr.Zero). Provjeri potpis i UAC.");
+            Console.WriteLine("[!] At least one hook failed to register (IntPtr.Zero). Check signatures and UAC.");
         }
 
-        Console.WriteLine("[i] Hooks aktivni. Pritisni Ctrl+C za izlaz.");
+        Console.WriteLine("[i] Hooks active. Press Ctrl+C to exit.");
 
         // Setup console cancel handler for clean shutdown
         Console.CancelKeyPress += (sender, e) =>
@@ -128,7 +133,7 @@ class Program
             e.Cancel = true;
             Console.WriteLine("\n[i] Shutting down...");
             CleanupHooks();
-            DisposeNotifyIcon();
+            DisposeAppIcon();
             if (_hiddenForm != null)
             {
                 _hiddenForm.Invoke(new Action(() => Application.Exit()));
@@ -150,8 +155,13 @@ class Program
             ShowInTaskbar = false,
             Visible = false
         };
-        _hiddenForm.FormClosed += (_, __) => DisposeNotifyIcon();
-        
+        if (_appIcon != null)
+        {
+            _hiddenForm.Icon = _appIcon;
+        }
+        _hiddenForm.FormClosed += (_, __) => DisposeAppIcon();
+        _hiddenForm.Shown += (_, __) => ShowStatusToast(true);
+
         GC.KeepAlive(_cb); // drži delegata živim
         Application.Run(_hiddenForm);
     }
@@ -349,7 +359,7 @@ class Program
             var wins = ordered;
 
             int count = wins.Count;
-            Console.WriteLine($"[∴] Monitor layout: {count} prozor(a)");
+            Console.WriteLine($"[∴] Monitor layout: {count} window(s)");
             if (count == 0) return;
 
             if (MonitorHasFullscreenWindow(monitor))
@@ -581,23 +591,23 @@ class Program
         _isActive = active;
         if (_isActive)
         {
-            Console.WriteLine("[i] Jiraiya nastavlja (Win+Alt+J)");
+            Console.WriteLine("[i] Jiraiya resumed (Win+Alt+J)");
             ScanAllCandidates();
             ApplyAllLayouts();
             ReapplyFocusHighlight();
-            ShowStatusNotification("Jiraiya", "Upaljen.");
+            ShowStatusToast(true);
         }
         else
         {
-            Console.WriteLine("[i] Jiraiya pauziran (Win+Alt+J)");
+            Console.WriteLine("[i] Jiraiya paused (Win+Alt+J)");
             ClearFocusHighlight();
-            ShowStatusNotification("Jiraiya", "Zaustavljen.");
+            ShowStatusToast(false);
         }
     }
 
     static void OnDisplaySettingsChanged(object? sender, EventArgs e)
     {
-        Console.WriteLine("[i] Promjena monitora detektirana – osvježavam layout");
+        Console.WriteLine("[i] Display change detected – refreshing layout");
         DiscoverAllMonitors();
         ScanAllCandidates();
         ApplyAllLayouts();
@@ -621,53 +631,163 @@ class Program
         return b | (g << 8) | (r << 16);
     }
 
-    static void ShowStatusNotification(string title, string message)
+    static void ShowStatusToast(bool enabled)
     {
+        string state = enabled ? "Enabled" : "Disabled";
+        ShowToast("Jiraiya", state);
+    }
+
+    static void ShowToast(string title, string message)
+    {
+        void Show()
+        {
+            Form toast = new()
+            {
+                FormBorderStyle = FormBorderStyle.None,
+                StartPosition = FormStartPosition.Manual,
+                ShowInTaskbar = false,
+                TopMost = true,
+                BackColor = Color.FromArgb(32, 32, 32),
+                Opacity = 0.95,
+                Size = new Size(260, 96)
+            };
+
+            int radius = 14;
+            toast.Paint += (_, args) =>
+            {
+                using Pen pen = new(Color.FromArgb(120, 255, 255, 255), 1);
+                Rectangle bounds = new(Point.Empty, toast.Size - new Size(1, 1));
+                using GraphicsPath path = CreateRoundedPath(bounds, radius);
+                args.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                args.Graphics.DrawPath(pen, path);
+            };
+
+            Label titleLabel = new()
+            {
+                Text = title,
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 11, FontStyle.Bold),
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Top,
+                Height = 42,
+                Padding = new Padding(72, 10, 16, 0)
+            };
+
+            Label messageLabel = new()
+            {
+                Text = message,
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 10, FontStyle.Regular),
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill,
+                Padding = new Padding(72, 0, 16, 14)
+            };
+
+            if (_appIcon != null)
+            {
+                PictureBox iconBox = new()
+                {
+                    Image = _appIcon.ToBitmap(),
+                    SizeMode = PictureBoxSizeMode.StretchImage,
+                    Size = new Size(48, 48),
+                    Location = new Point(16, 24)
+                };
+                toast.Controls.Add(iconBox);
+                iconBox.BringToFront();
+            }
+
+            toast.Controls.Add(messageLabel);
+            toast.Controls.Add(titleLabel);
+
+            using (GraphicsPath regionPath = CreateRoundedPath(new Rectangle(Point.Empty, toast.Size), radius))
+            {
+                toast.Region = new Region(regionPath);
+            }
+
+            Rectangle screen = Screen.PrimaryScreen?.WorkingArea ?? Screen.GetWorkingArea(Point.Empty);
+            toast.Left = screen.Left + (screen.Width - toast.Width) / 2;
+            toast.Top = screen.Bottom - toast.Height - 24;
+
+            System.Windows.Forms.Timer timer = new() { Interval = 1000 };
+            timer.Tick += (_, __) =>
+            {
+                timer.Stop();
+                toast.Close();
+            };
+
+            toast.Shown += (_, __) => timer.Start();
+            toast.FormClosed += (_, __) => timer.Dispose();
+
+            toast.Show();
+        }
+
         if (_hiddenForm != null && _hiddenForm.InvokeRequired)
         {
-            _hiddenForm.BeginInvoke(new Action(() => ShowNotificationInternal(title, message)));
+            _hiddenForm.BeginInvoke(new Action(Show));
         }
         else
         {
-            ShowNotificationInternal(title, message);
+            Show();
         }
     }
 
-    static void ShowNotificationInternal(string title, string message)
+    static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
     {
-        EnsureNotifyIcon();
-        if (_notifyIcon == null) return;
+        int diameter = radius * 2;
+        Size size = new(diameter, diameter);
+        Rectangle arc = new(bounds.Location, size);
+        GraphicsPath path = new();
 
-        _notifyIcon.BalloonTipTitle = title;
-        _notifyIcon.BalloonTipText = message;
-        _notifyIcon.ShowBalloonTip(3000);
+        // top left
+        path.AddArc(arc, 180, 90);
+
+        // top right
+        arc.X = bounds.Right - diameter;
+        path.AddArc(arc, 270, 90);
+
+        // bottom right
+        arc.Y = bounds.Bottom - diameter;
+        path.AddArc(arc, 0, 90);
+
+        // bottom left
+        arc.X = bounds.Left;
+        path.AddArc(arc, 90, 90);
+
+        path.CloseFigure();
+        return path;
     }
 
-    static void EnsureNotifyIcon()
+    static void LoadAppIcon()
     {
-        if (_notifyIcon != null) return;
-
-        _notifyIcon = new NotifyIcon
-        {
-            Icon = SystemIcons.Application,
-            Visible = true,
-            Text = "Jiraiya",
-            BalloonTipIcon = ToolTipIcon.Info
-        };
-    }
-
-    static void DisposeNotifyIcon()
-    {
-        if (_notifyIcon == null) return;
-
         try
         {
-            _notifyIcon.Visible = false;
-            _notifyIcon.Dispose();
+            if (!File.Exists(_frogIconPath))
+            {
+                return;
+            }
+
+            DisposeAppIcon();
+            _appIcon = new Icon(_frogIconPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[!] Failed to load frog icon: {ex.Message}");
+            _appIcon = null;
+        }
+    }
+
+    static void DisposeAppIcon()
+    {
+        if (_appIcon == null) return;
+        try
+        {
+            _appIcon.Dispose();
         }
         finally
         {
-            _notifyIcon = null;
+            _appIcon = null;
         }
     }
 
@@ -687,7 +807,7 @@ class Program
         _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, moduleHandle, 0);
         if (_keyboardHook == IntPtr.Zero)
         {
-            Console.WriteLine("[!] Keyboard hook nije postavljen.");
+            Console.WriteLine("[!] Keyboard hook failed to install.");
         }
     }
 
@@ -856,7 +976,7 @@ class Program
         if (sent != inputs.Length)
         {
             int error = Marshal.GetLastWin32Error();
-            Console.WriteLine($"[!] SendInput nije uspio (err={error}).");
+            Console.WriteLine($"[!] SendInput failed (err={error}).");
             return false;
         }
 
