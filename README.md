@@ -20,5 +20,17 @@ Jiraiya is a lightweight tiling assistant for Windows inspired by David Heinemei
 | Move with the mouse | Drag a window | Drop a window onto the desired slot (A, B, C) to swap positions automatically. |
 | Exit the utility | Close console or tray menu | Press `Ctrl + C` in the console window or exit via the tray icon. |
 
+## Configuration
+Jiraiya reads its settings from `config.json` in the application directory (the file is generated alongside the executable). A reference template with the default values lives in `config.default.json`; copy it when you want to reset or customise the configuration.
+
+| Setting | Type | Description |
+| --- | --- | --- |
+| `ignore_apps` | `string[]` | Full paths to executables that Jiraiya should never tile. Paths are matched case-insensitively. |
+| `ignore_dialogs` | `bool` | When `true`, dialog-style windows are skipped from tiling. |
+| `center_ignored_windows` | `bool` | When `true`, windows that are ignored (either because they match `ignore_apps` or are dialogs) are centred on their monitor instead of being left where Windows placed them. |
+| `debounce_in_ms` | `int` | Delay before the layout is recomputed after a window event. Use `120` for the default behaviour. |
+
+All settings are mandatory. If a value is missing or the file cannot be parsed, Jiraiya reports the configuration error in the console and exits, ensuring the tiler never runs with partially defined behaviour.
+
 ---
 Built with .NET and the Win32 API to keep your desktop orderly without breaking your Windows workflow.

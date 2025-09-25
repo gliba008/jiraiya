@@ -20,6 +20,8 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Timers;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -27,7 +29,7 @@ using Microsoft.Win32;
 class Program
 {
     // --- Config ---
-    const int DebounceMs = 120; // delay before recompute after an event
+    const int DefaultDebounceMs = 120; // fallback debounce delay if config fails early
 
     // WinEvent hooks
     static IntPtr _hookShowHide = IntPtr.Zero;
@@ -43,7 +45,7 @@ class Program
     static uint _accentArgb = 0xFF3388FF; // default fallback (ARGB)
     static bool _isActive = true;
 
-    static readonly System.Timers.Timer _debounce = new(DebounceMs) { AutoReset = false, Enabled = false };
+    static readonly System.Timers.Timer _debounce = new(DefaultDebounceMs) { AutoReset = false, Enabled = false };
     static Form? _hiddenForm;
     static IntPtr _keyboardHook = IntPtr.Zero;
     static LowLevelKeyboardProc? _keyboardProc;
@@ -60,9 +62,14 @@ class Program
     static Icon? _appIcon;
     static readonly string _frogIconPath = Path.Combine(AppContext.BaseDirectory, "frog.ico");
     static readonly Dictionary<IntPtr, FullscreenToggleState> _fullscreenToggles = new();
+    static AppConfiguration _config = null!;
+    static readonly HashSet<IntPtr> _ignoredWindows = new();
+    static readonly HashSet<IntPtr> _centeredIgnoredWindows = new();
+    static readonly Dictionary<uint, string?> _processPathCache = new();
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
+    enum IgnoreReason { None, ListedApp, Dialog }
 
     sealed class FullscreenToggleState
     {
@@ -76,6 +83,70 @@ class Program
         public IntPtr Monitor { get; }
         public Dictionary<IntPtr, RECT> WindowRects { get; }
         public List<IntPtr> OrderedHandles { get; }
+    }
+
+    sealed class AppConfiguration
+    {
+        [JsonPropertyName("ignore_apps")]
+        public string[]? IgnoreAppsRaw { get; set; }
+
+        [JsonPropertyName("ignore_dialogs")]
+        public bool? IgnoreDialogsRaw { get; set; }
+
+        [JsonPropertyName("center_ignored_windows")]
+        public bool? CenterIgnoredWindowsRaw { get; set; }
+
+        [JsonPropertyName("debounce_in_ms")]
+        public int? DebounceInMsRaw { get; set; }
+
+        string[] _ignoreApps = Array.Empty<string>();
+
+        public IReadOnlyList<string> IgnoreApps => _ignoreApps;
+        public bool IgnoreDialogs { get; private set; }
+        public bool CenterIgnoredWindows { get; private set; }
+        public int DebounceInMs { get; private set; }
+
+        public void Validate()
+        {
+            if (IgnoreAppsRaw is null)
+            {
+                throw new InvalidOperationException("Configuration value 'ignore_apps' is missing.");
+            }
+            if (IgnoreDialogsRaw is null)
+            {
+                throw new InvalidOperationException("Configuration value 'ignore_dialogs' is missing.");
+            }
+            if (CenterIgnoredWindowsRaw is null)
+            {
+                throw new InvalidOperationException("Configuration value 'center_ignored_windows' is missing.");
+            }
+            if (DebounceInMsRaw is null)
+            {
+                throw new InvalidOperationException("Configuration value 'debounce_in_ms' is missing.");
+            }
+
+            HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+            List<string> cleaned = new();
+            foreach (var entry in IgnoreAppsRaw)
+            {
+                if (string.IsNullOrWhiteSpace(entry)) continue;
+                string normalized = entry.Trim();
+                if (seen.Add(normalized))
+                {
+                    cleaned.Add(normalized);
+                }
+            }
+
+            _ignoreApps = cleaned.ToArray();
+            IgnoreDialogs = IgnoreDialogsRaw.Value;
+            CenterIgnoredWindows = CenterIgnoredWindowsRaw.Value;
+            int debounce = DebounceInMsRaw.Value;
+            if (debounce <= 0)
+            {
+                throw new InvalidOperationException("Configuration value 'debounce_in_ms' must be greater than 0.");
+            }
+            DebounceInMs = debounce;
+        }
     }
 
     // DRŽI delegata u static polju (+ pravilna konvencija poziva)
@@ -95,6 +166,19 @@ class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
         Console.WriteLine("Jiraiya - multi-monitor window tiling\n");
+
+        try
+        {
+            _config = LoadConfiguration();
+            _debounce.Interval = _config.DebounceInMs;
+            Console.WriteLine($"[i] Configuration loaded (ignore_apps={_config.IgnoreApps.Count}, ignore_dialogs={_config.IgnoreDialogs}, center_ignored_windows={_config.CenterIgnoredWindows}, debounce_in_ms={_config.DebounceInMs})");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[!] Configuration error: " + ex.Message);
+            Environment.Exit(1);
+            return;
+        }
 
         if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         {
@@ -237,6 +321,7 @@ class Program
         // Reverse so we process bottom-to-top which better matches taskbar ordering
         allWindows.Reverse();
 
+        var enumeratedHandles = new HashSet<IntPtr>(allWindows);
         var perMonitorCandidates = new Dictionary<IntPtr, HashSet<IntPtr>>();
         var perMonitorOrder = new Dictionary<IntPtr, List<IntPtr>>();
         var seenWindows = new HashSet<IntPtr>();
@@ -326,6 +411,11 @@ class Program
                 state.WindowRects.Remove(stale);
             }
             state.OrderedHandles.RemoveAll(h => !IsWindow(h));
+        }
+
+        foreach (var staleIgnored in _ignoredWindows.Where(h => !enumeratedHandles.Contains(h)).ToList())
+        {
+            RemoveIgnoredTracking(staleIgnored);
         }
     }
 
@@ -419,35 +509,372 @@ class Program
         }
     }
 
-    static bool IsWindowValidForLayout(IntPtr h)
+    static bool IsWindowValidForLayout(IntPtr hwnd)
     {
-        if (!IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
+        if (!PassesBasicWindowChecks(hwnd, out long style, out long exStyle))
+        {
+            RemoveIgnoredTracking(hwnd);
+            return false;
+        }
 
-        long style = GetWindowLongPtr(h, GWL_STYLE).ToInt64();
-        long ex = GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64();
-        const long WS_OVERLAPPEDWINDOW = 0x00CF0000;
-        const long WS_EX_TOOLWINDOW = 0x00000080;
+        var ignoreReason = GetIgnoreReason(hwnd, style, exStyle);
+        if (ignoreReason != IgnoreReason.None)
+        {
+            HandleIgnoredWindow(hwnd, ignoreReason);
+            return false;
+        }
 
-        if ((ex & WS_EX_TOOLWINDOW) != 0) return false;
-        if ((style & WS_OVERLAPPEDWINDOW) == 0) return false;
+        if (!IsLayoutStyleEligible(style, exStyle))
+        {
+            RemoveIgnoredTracking(hwnd);
+            return false;
+        }
+
+        RemoveIgnoredTracking(hwnd);
+        return true;
+    }
+
+    static bool PassesBasicWindowChecks(IntPtr hwnd, out long style, out long exStyle)
+    {
+        style = 0;
+        exStyle = 0;
+
+        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))
+        {
+            return false;
+        }
+
+        style = GetWindowLongPtr(hwnd, GWL_STYLE).ToInt64();
+        exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64();
 
         // exclude cloaked (UWP)
-        if (DwmGetWindowAttribute(h, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0) return false;
-
-        if (GetWindowRect(h, out RECT windowRect))
+        if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0)
         {
-            var monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+            return false;
+        }
+
+        if (GetWindowRect(hwnd, out RECT windowRect))
+        {
+            var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             if (monitor != IntPtr.Zero)
             {
                 MONITORINFO mi = new() { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
                 if (GetMonitorInfo(monitor, ref mi))
                 {
-                    if (IsFullscreenRect(windowRect, mi.rcMonitor)) return false;
+                    if (IsFullscreenRect(windowRect, mi.rcMonitor))
+                    {
+                        return false;
+                    }
                 }
             }
         }
 
         return true;
+    }
+
+    static bool IsLayoutStyleEligible(long style, long exStyle)
+    {
+        const long WS_OVERLAPPEDWINDOW = 0x00CF0000;
+        const long WS_EX_TOOLWINDOW = 0x00000080;
+
+        if ((exStyle & WS_EX_TOOLWINDOW) != 0)
+        {
+            return false;
+        }
+
+        if ((style & WS_OVERLAPPEDWINDOW) == 0)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    static IgnoreReason GetIgnoreReason(IntPtr hwnd, long style, long exStyle)
+    {
+        if (IsIgnoredApplicationWindow(hwnd))
+        {
+            return IgnoreReason.ListedApp;
+        }
+
+        if (_config.IgnoreDialogs && IsDialogWindow(hwnd, style, exStyle))
+        {
+            return IgnoreReason.Dialog;
+        }
+
+        return IgnoreReason.None;
+    }
+
+    static bool IsIgnoredApplicationWindow(IntPtr hwnd)
+    {
+        if (_config.IgnoreApps.Count == 0)
+        {
+            return false;
+        }
+
+        uint pid = GetWindowProcessId(hwnd);
+        if (pid == 0)
+        {
+            return false;
+        }
+
+        string? exePath = TryGetProcessImagePath(pid);
+        string? exeFileName = null;
+
+        if (!string.IsNullOrEmpty(exePath))
+        {
+            exeFileName = Path.GetFileName(exePath);
+        }
+        else
+        {
+            try
+            {
+                using Process proc = Process.GetProcessById((int)pid);
+                if (!string.IsNullOrEmpty(proc.ProcessName))
+                {
+                    exeFileName = proc.ProcessName + ".exe";
+                }
+            }
+            catch
+            {
+                // ignored – process may have exited or access denied
+            }
+        }
+
+        foreach (var entry in _config.IgnoreApps)
+        {
+            if (string.IsNullOrWhiteSpace(entry)) continue;
+
+            if (!string.IsNullOrEmpty(exePath) && string.Equals(exePath, entry, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var entryName = Path.GetFileName(entry);
+            if (!string.IsNullOrEmpty(entryName) && !string.IsNullOrEmpty(exeFileName) &&
+                string.Equals(entryName, exeFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool IsDialogWindow(IntPtr hwnd, long style, long exStyle)
+    {
+        const long WS_POPUP = unchecked((long)0x80000000);
+        const long WS_THICKFRAME = 0x00040000;
+        const long WS_DLGFRAME = 0x00400000;
+        const long WS_MINIMIZEBOX = 0x00020000;
+        const long WS_MAXIMIZEBOX = 0x00010000;
+        const long WS_CAPTION = 0x00C00000;
+        const long WS_EX_DLGMODALFRAME = 0x00000001;
+
+        var classNameBuilder = new StringBuilder(256);
+        bool classIsDialog = GetClassName(hwnd, classNameBuilder, classNameBuilder.Capacity) > 0 &&
+                             classNameBuilder.ToString().Equals("#32770", StringComparison.Ordinal);
+
+        if (classIsDialog)
+        {
+            return true;
+        }
+
+        if ((exStyle & WS_EX_DLGMODALFRAME) != 0)
+        {
+            return true;
+        }
+
+        bool lacksResizeBorder = (style & WS_THICKFRAME) == 0;
+        bool lacksMinimize = (style & WS_MINIMIZEBOX) == 0;
+        bool lacksMaximize = (style & WS_MAXIMIZEBOX) == 0;
+        bool hasDlgFrame = (style & WS_DLGFRAME) != 0;
+        bool hasCaption = (style & WS_CAPTION) != 0;
+        bool isPopup = (style & WS_POPUP) != 0;
+
+        if (hasDlgFrame && lacksResizeBorder)
+        {
+            return true;
+        }
+
+        if (lacksResizeBorder && lacksMinimize && lacksMaximize && hasCaption)
+        {
+            return true;
+        }
+
+        if (isPopup && lacksResizeBorder && lacksMinimize && lacksMaximize)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    static void HandleIgnoredWindow(IntPtr hwnd, IgnoreReason reason)
+    {
+        bool firstObservation = _ignoredWindows.Add(hwnd);
+        if (firstObservation)
+        {
+            Console.WriteLine($"[ign] Skipping hwnd=0x{hwnd.ToInt64():X} reason={reason}{DescribeWindowForLogs(hwnd)}");
+        }
+
+        if (_config.CenterIgnoredWindows && _centeredIgnoredWindows.Add(hwnd))
+        {
+            if (CenterIgnoredWindow(hwnd))
+            {
+                Console.WriteLine("    ↳ centered ignored window");
+            }
+            else
+            {
+                Console.WriteLine("    ↳ centering ignored window failed");
+            }
+        }
+    }
+
+    static void RemoveIgnoredTracking(IntPtr hwnd)
+    {
+        _ignoredWindows.Remove(hwnd);
+        _centeredIgnoredWindows.Remove(hwnd);
+    }
+
+    static bool CenterIgnoredWindow(IntPtr hwnd)
+    {
+        if (!GetWindowRect(hwnd, out RECT rect))
+        {
+            return false;
+        }
+
+        var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (monitor == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        MONITORINFO info = new() { cbSize = (uint)Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(monitor, ref info))
+        {
+            return false;
+        }
+
+        RECT work = info.rcWork;
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        int workWidth = work.right - work.left;
+        int workHeight = work.bottom - work.top;
+
+        if (width <= 0 || height <= 0 || workWidth <= 0 || workHeight <= 0)
+        {
+            return false;
+        }
+
+        int x = work.left + (workWidth - width) / 2;
+        int y = work.top + (workHeight - height) / 2;
+
+        uint flags = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
+        return SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0, flags);
+    }
+
+    static string DescribeWindowForLogs(IntPtr hwnd)
+    {
+        var builder = new StringBuilder();
+        uint pid = GetWindowProcessId(hwnd);
+        if (pid != 0)
+        {
+            builder.Append(' ');
+            builder.Append("pid=");
+            builder.Append(pid);
+        }
+
+        string? exe = TryGetProcessImagePath(pid);
+        if (!string.IsNullOrEmpty(exe))
+        {
+            builder.Append(' ');
+            builder.Append("exe=\"");
+            builder.Append(exe);
+            builder.Append('"');
+        }
+
+        string title = GetWindowTitle(hwnd);
+        if (!string.IsNullOrEmpty(title))
+        {
+            builder.Append(' ');
+            builder.Append("title=\"");
+            builder.Append(title);
+            builder.Append('"');
+        }
+
+        return builder.ToString();
+    }
+
+    static string GetWindowTitle(IntPtr hwnd)
+    {
+        int length = GetWindowTextLength(hwnd);
+        if (length <= 0)
+        {
+            return string.Empty;
+        }
+
+        var buffer = new StringBuilder(length + 1);
+        return GetWindowText(hwnd, buffer, buffer.Capacity) > 0 ? buffer.ToString() : string.Empty;
+    }
+
+    static uint GetWindowProcessId(IntPtr hwnd)
+    {
+        _ = GetWindowThreadProcessId(hwnd, out uint pid);
+        return pid;
+    }
+
+    static string? TryGetProcessImagePath(uint pid)
+    {
+        if (pid == 0)
+        {
+            return null;
+        }
+
+        if (_processPathCache.TryGetValue(pid, out var cached))
+        {
+            return cached;
+        }
+
+        IntPtr processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (processHandle == IntPtr.Zero)
+        {
+            _processPathCache[pid] = null;
+            return null;
+        }
+
+        try
+        {
+            int capacity = 260;
+            while (true)
+            {
+                var pathBuilder = new StringBuilder(capacity);
+                int size = pathBuilder.Capacity;
+                if (QueryFullProcessImageName(processHandle, 0, pathBuilder, ref size))
+                {
+                    string path = pathBuilder.ToString(0, size);
+                    _processPathCache[pid] = path;
+                    return path;
+                }
+
+                int error = Marshal.GetLastWin32Error();
+                const int ERROR_INSUFFICIENT_BUFFER = 122;
+                if (error == ERROR_INSUFFICIENT_BUFFER)
+                {
+                    capacity *= 2;
+                    continue;
+                }
+
+                break;
+            }
+        }
+        finally
+        {
+            CloseHandle(processHandle);
+        }
+
+        _processPathCache[pid] = null;
+        return null;
     }
 
     static List<RECT> CalculateStableGrid(RECT workArea, int count)
@@ -1093,6 +1520,86 @@ class Program
         Console.WriteLine($"    → {context}: {(ok ? "OK" : "FAIL")} hwnd=0x{hwnd.ToInt64():X}");
     }
 
+    static AppConfiguration LoadConfiguration()
+    {
+        string configPath = LocateConfigurationPath();
+
+        using FileStream stream = File.OpenRead(configPath);
+        JsonSerializerOptions options = new()
+        {
+            PropertyNameCaseInsensitive = true,
+            ReadCommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true
+        };
+
+        AppConfiguration? config = JsonSerializer.Deserialize<AppConfiguration>(stream, options);
+        if (config == null)
+        {
+            throw new InvalidOperationException("Configuration file is empty or invalid JSON.");
+        }
+
+        config.Validate();
+        return config;
+    }
+
+    static string LocateConfigurationPath()
+    {
+        List<string> searchedLocations = new();
+
+        string? config = ProbeForConfiguration(AppContext.BaseDirectory, searchedLocations);
+        if (config == null)
+        {
+            string currentDir = Directory.GetCurrentDirectory();
+            if (!string.Equals(currentDir, AppContext.BaseDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                config = ProbeForConfiguration(currentDir, searchedLocations);
+            }
+        }
+
+        if (config != null)
+        {
+            return config;
+        }
+
+        string searched = searchedLocations.Count == 0 ? "(none)" : string.Join(", ", searchedLocations);
+        throw new InvalidOperationException($"Configuration file not found. Searched: {searched}");
+    }
+
+    static string? ProbeForConfiguration(string? startingDirectory, List<string> searched)
+    {
+        if (string.IsNullOrWhiteSpace(startingDirectory))
+        {
+            return null;
+        }
+
+        DirectoryInfo? directory;
+        try
+        {
+            directory = new DirectoryInfo(Path.GetFullPath(startingDirectory));
+        }
+        catch
+        {
+            return null;
+        }
+
+        const int maxLevels = 8;
+        int traversed = 0;
+        while (directory != null && traversed < maxLevels)
+        {
+            string candidate = Path.Combine(directory.FullName, "config.json");
+            searched.Add(candidate);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            directory = directory.Parent;
+            traversed++;
+        }
+
+        return null;
+    }
+
     static bool IsArrowKey(Keys key) => key is Keys.Left or Keys.Right or Keys.Up or Keys.Down;
 
     static Direction DirectionFromKey(Keys key) => key switch
@@ -1193,6 +1700,12 @@ class Program
         if (_suppressMoveEvents || hwnd == IntPtr.Zero) return;
         if (!IsWindow(hwnd)) return;
 
+        if (!IsWindowValidForLayout(hwnd))
+        {
+            _draggingWindow = IntPtr.Zero;
+            return;
+        }
+
         var monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         if (monitor == IntPtr.Zero) return;
 
@@ -1222,6 +1735,12 @@ class Program
     static void HandleMoveSizeEnd(IntPtr hwnd)
     {
         if (!_isActive)
+        {
+            _draggingWindow = IntPtr.Zero;
+            return;
+        }
+
+        if (!IsWindowValidForLayout(hwnd))
         {
             _draggingWindow = IntPtr.Zero;
             return;
@@ -1474,6 +1993,11 @@ class Program
 
     static void MoveWindowToSlot(IntPtr monitor, IntPtr hwnd, int slotIndex)
     {
+        if (!IsWindowValidForLayout(hwnd))
+        {
+            return;
+        }
+
         if (!_candidatesPerMonitor.TryGetValue(monitor, out var candidates))
         {
             candidates = new HashSet<IntPtr>();
@@ -1907,6 +2431,7 @@ class Program
     const int DWMWA_BORDER_WIDTH = 35;
     const int DWMWA_COLOR_DEFAULT = unchecked((int)0xFFFFFFFF);
 
+    const uint SWP_NOSIZE = 0x0001;
     const uint SWP_NOZORDER = 0x0004;
     const uint SWP_NOOWNERZORDER = 0x0200;
     const uint SWP_NOACTIVATE = 0x0010;
@@ -1928,6 +2453,7 @@ class Program
     const ushort VK_CONTROL = 0x11;
 
     static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new(-4);
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -1941,6 +2467,9 @@ class Program
 
     [DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
@@ -1952,6 +2481,7 @@ class Program
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
@@ -1959,6 +2489,9 @@ class Program
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)] static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)] static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr hObject);
 
     // manja struktura
     [DllImport("user32.dll", SetLastError = true, EntryPoint = "GetMonitorInfo")]

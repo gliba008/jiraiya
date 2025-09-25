@@ -1,0 +1,6 @@
+{
+  "ignore_apps": [],
+  "ignore_dialogs": true,
+  "center_ignored_windows": true,
+  "debounce_in_ms": 120
+}
