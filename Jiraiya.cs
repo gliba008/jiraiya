@@ -72,6 +72,11 @@ class Program
     static ContextMenuStrip? _trayMenu;
     static ToolStripMenuItem? _toggleMenuItem;
     static string _configPath = string.Empty;
+    static readonly HashSet<IntPtr> _minimizeSnapshot = new();
+    static bool _minimizeSnapshotActive;
+#if DEBUG
+    static StreamWriter? _debugLogWriter;
+#endif
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -170,6 +175,9 @@ class Program
 
     static void Main()
     {
+#if DEBUG
+        InitializeDebugLogging();
+#endif
         TryEnableConsoleUtf8();
         Console.WriteLine("Jiraiya - multi-monitor window tiling\n");
 
@@ -237,6 +245,9 @@ class Program
             CleanupHooks();
             DisposeTrayIcon();
             DisposeAppIcon();
+#if DEBUG
+            DisposeDebugLogging();
+#endif
         };
 
         // Create invisible form to handle message loop
@@ -656,7 +667,6 @@ class Program
 
     static bool IsDialogWindow(IntPtr hwnd, long style, long exStyle)
     {
-        const long WS_POPUP = unchecked((long)0x80000000);
         const long WS_THICKFRAME = 0x00040000;
         const long WS_DLGFRAME = 0x00400000;
         const long WS_MINIMIZEBOX = 0x00020000;
@@ -1332,6 +1342,13 @@ class Program
                     return (IntPtr)1;
                 }
 
+                if (_winPressed && _altPressed && key == Keys.M)
+                {
+                    ToggleMinimizeManagedWindows();
+                    _swallowedKeys.Add(info.vkCode);
+                    return (IntPtr)1;
+                }
+
                 if (_altPressed && key == Keys.F11)
                 {
                     ToggleFullscreenForActiveWindow();
@@ -1635,6 +1652,10 @@ class Program
 
         _trayMenu.Items.Add(new ToolStripSeparator());
 
+        var restartItem = new ToolStripMenuItem("Restart");
+        restartItem.Click += (_, __) => RequestRestart();
+        _trayMenu.Items.Add(restartItem);
+
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, __) => RequestExit();
         _trayMenu.Items.Add(exitItem);
@@ -1730,6 +1751,30 @@ class Program
         }
     }
 
+    static void RequestRestart()
+    {
+        try
+        {
+            string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
+            if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    WorkingDirectory = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory,
+                    UseShellExecute = true
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to restart Jiraiya:\n{ex.Message}", GetAppTitle(), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        RequestExit();
+    }
+
     static void DisposeTrayIcon()
     {
         if (_trayIcon != null)
@@ -1790,6 +1835,43 @@ class Program
             // console might not exist in WinExe mode
         }
     }
+#if DEBUG
+    static void InitializeDebugLogging()
+    {
+        try
+        {
+            string logPath = Path.Combine(AppContext.BaseDirectory, "jiraiya-log.txt");
+            _debugLogWriter?.Dispose();
+            string? directory = Path.GetDirectoryName(logPath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            FileStream stream = new(logPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            _debugLogWriter = new StreamWriter(stream) { AutoFlush = true };
+            Console.SetOut(_debugLogWriter);
+            Console.SetError(_debugLogWriter);
+        }
+        catch
+        {
+            // ignore logging failures in debug builds
+        }
+    }
+
+    static void DisposeDebugLogging()
+    {
+        try
+        {
+            _debugLogWriter?.Flush();
+            _debugLogWriter?.Dispose();
+            _debugLogWriter = null;
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+#endif
 
     static bool IsArrowKey(Keys key) => key is Keys.Left or Keys.Right or Keys.Up or Keys.Down;
 
@@ -2461,6 +2543,132 @@ class Program
         FocusWindowOnMonitor(target);
     }
 
+    static void ToggleMinimizeManagedWindows()
+    {
+        ScanAllCandidates();
+
+        CleanupMinimizeSnapshot();
+
+        var managed = GetAllManagedWindows();
+        var openManaged = managed.Where(hwnd => IsWindow(hwnd) && !IsIconic(hwnd)).Distinct().ToList();
+
+        if (openManaged.Count == 0)
+        {
+            if (_minimizeSnapshotActive && _minimizeSnapshot.Count > 0 && AreAllSnapshotWindowsMinimized())
+            {
+                RestoreMinimizeSnapshot();
+            }
+            return;
+        }
+
+        _minimizeSnapshot.Clear();
+        _minimizeSnapshotActive = false;
+
+        foreach (var hwnd in openManaged)
+        {
+            MinimizeWindowAndTrack(hwnd);
+        }
+
+        if (_minimizeSnapshotActive)
+        {
+            ClearFocusHighlight();
+        }
+    }
+
+    static List<IntPtr> GetAllManagedWindows()
+    {
+        var result = new List<IntPtr>();
+        foreach (var monitor in _allMonitors)
+        {
+            var order = GetOrderedWindowsForMonitor(monitor);
+            foreach (var hwnd in order)
+            {
+                if (!result.Contains(hwnd))
+                {
+                    result.Add(hwnd);
+                }
+            }
+        }
+        return result;
+    }
+
+    static void MinimizeWindowAndTrack(IntPtr hwnd)
+    {
+        if (!IsWindow(hwnd) || IsIconic(hwnd))
+        {
+            return;
+        }
+
+        if (ShowWindow(hwnd, SW_MINIMIZE))
+        {
+            _minimizeSnapshot.Add(hwnd);
+            _minimizeSnapshotActive = true;
+        }
+    }
+
+    static void CleanupMinimizeSnapshot()
+    {
+        if (_minimizeSnapshot.Count == 0)
+        {
+            _minimizeSnapshotActive = false;
+            return;
+        }
+
+        foreach (var hwnd in _minimizeSnapshot.Where(h => !IsWindow(h)).ToList())
+        {
+            _minimizeSnapshot.Remove(hwnd);
+        }
+
+        if (_minimizeSnapshot.Count == 0)
+        {
+            _minimizeSnapshotActive = false;
+        }
+    }
+
+    static bool AreAllSnapshotWindowsMinimized()
+    {
+        foreach (var hwnd in _minimizeSnapshot)
+        {
+            if (IsWindow(hwnd) && !IsIconic(hwnd))
+            {
+                return false;
+            }
+        }
+        return _minimizeSnapshot.Count > 0;
+    }
+
+    static void RestoreMinimizeSnapshot()
+    {
+        bool restoredAny = false;
+        foreach (var hwnd in _minimizeSnapshot.ToList())
+        {
+            if (!IsWindow(hwnd))
+            {
+                _minimizeSnapshot.Remove(hwnd);
+                continue;
+            }
+
+            if (IsIconic(hwnd))
+            {
+                ShowWindow(hwnd, SW_RESTORE);
+                restoredAny = true;
+            }
+        }
+
+        _minimizeSnapshot.Clear();
+        _minimizeSnapshotActive = false;
+
+        if (restoredAny)
+        {
+            ScanAllCandidates();
+            if (_isActive)
+            {
+                ApplyAllLayouts();
+                ReapplyFocusHighlight();
+            }
+        }
+    }
+
     static GridSlot GetSlotForIndex(int index) => index switch
     {
         0 => GridSlot.A,
@@ -2631,6 +2839,9 @@ class Program
     const uint GA_ROOT = 2;
 
     const int SW_SHOWNORMAL = 1;
+    const int SW_SHOWMINIMIZED = 2;
+    const int SW_MINIMIZE = 6;
+    const int SW_RESTORE = 9;
 
     const int WM_KEYDOWN = 0x0100;
     const int WM_KEYUP = 0x0101;
