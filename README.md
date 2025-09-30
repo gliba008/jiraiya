@@ -1,12 +1,12 @@
-# 🐸 Jiraiya Window Tiling Utility
+# 🐸 Jiraiya - Simple Window Tiling for Windows
 
 ## Introduction
-Jiraiya is a lightweight tiling assistant for Windows inspired by David Heinemeier Hansson's Omarchy Linux setup. It works alongside the operating system instead of fighting it: no exotic shell replacements, no hidden hacks, just tidy window placement across every monitor.
+Jiraiya is a lightweight tiling assistant for Windows inspired by [David Heinemeier Hansson's Omarchy Linux setup](https://omarchy.org/). It works alongside the operating system instead of fighting it.
 
 Jiraiya is also:
 
-- The toad-riding protagonist from the [Japanese folk tale](https://en.wikipedia.org/wiki/Jiraiya_(folklore)).
 - The legendary [Toad Sage](https://naruto.fandom.com/wiki/Jiraiya) of stupendous ninja skill from *Naruto*.
+- The toad-riding protagonist from the [Japanese folk tale](https://en.wikipedia.org/wiki/Jiraiya_(folklore)).
 
 ## How It Works
 - Launch Jiraiya and it immediately arranges the visible application windows into its three-slot layout (A, B, C) per monitor.
@@ -44,6 +44,63 @@ Jiraiya reads its settings from `config.json` in the application directory (the 
 | `debounce_in_ms` | `int` | Delay before the layout is recomputed after a window event. Use `120` for the default behaviour. |
 
 All settings are mandatory. If a value is missing or the file cannot be parsed, Jiraiya reports the configuration error and exits, ensuring the tiler never runs with partially defined behaviour.
+
+## 🚀 Getting Started
+
+To run this project locally, follow these steps:
+
+1. **Clone the repository**  
+   ```bash
+   git clone https://github.com/gliba008/jiraiya.git
+   cd jiraiya
+   ```
+
+2. **Install the .NET SDK**  
+   You’ll need the latest .NET SDK. Follow the instructions here:  
+   [Install .NET SDK (Windows)](https://learn.microsoft.com/en-us/dotnet/core/install/windows#install-with-visual-studio-code)
+
+3. **Build the application**  
+   ```bash
+   dotnet build
+   ```
+
+4. **Run the application**  
+   ```bash
+   dotnet run
+   ```
+
+---
+
+### 💻 Building for Windows
+
+If you want to use the app directly (without `dotnet run`), you can create a release build and run the executable:
+
+```bash
+dotnet publish -c Release --self-contained true
+```
+
+This will generate a `Jiraiya.exe` file inside the `bin/Release/net*/*/` folder (replace `*` with real data, check your folders).  
+Just double-click `Jiraiya.exe` to start it.  
+
+➡️ Optionally, you can also set it to launch automatically with Windows if you right-click the frog icon 🐸 in Windows tray.
+
+---
+
+### ⚠️ Note
+
+Right now this project is coded mainly to help me do the work while I’m on the move.  
+As it becomes more stable, I’ll provide simple release packages so you won’t need to build it yourself.
+
+---
+
+### 🌟 Inspiration
+
+On my other machine I use the **fantastic [Omarchy](https://world.hey.com/dhh/omakase-vs-omarchy-39e64848)** setup by DHH.  
+I really like the window tiling workflow there, and I wanted something similar on Windows - 
+but without breaking the usual Windows workflows.  
+
+That’s why I built this lightweight solution I can easily enable when I’m on a single monitor.  
+When I’m on multiple monitors, I usually just use the mouse and work without auto-tiling.
 
 ---
 Built with .NET and the Win32 API to keep your desktop orderly without breaking your Windows workflow.
