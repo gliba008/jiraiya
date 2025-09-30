@@ -1,7 +1,7 @@
 # 🐸 Jiraiya Window Tiling Utility
 
 ## Introduction
-Jiraiya [[2]](https://naruto.fandom.com/wiki/Jiraiya) is a lightweight tiling assistant for Windows inspired by David Heinemeier Hansson's Omarchy Linux setup. It works alongside the operating system instead of fighting it: no exotic shell replacements, no hidden hacks, just tidy window placement across every monitor.
+Jiraiya is a lightweight tiling assistant for Windows inspired by David Heinemeier Hansson's Omarchy Linux setup. It works alongside the operating system instead of fighting it: no exotic shell replacements, no hidden hacks, just tidy window placement across every monitor.
 
 Jiraiya is also:
 
