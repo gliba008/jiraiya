@@ -89,7 +89,7 @@ Just double-click `Jiraiya.exe` to start it.
 ### ⚠️ Note
 
 Right now this project is coded mainly to help me do the work while I’m on the move.  
-As it becomes more stable, I’ll provide simple release packages so you won’t need to build it yourself.
+As it becomes more stable, I’ll do the housekeeping and provide simple way to install Jiraiya.
 
 ---
 
