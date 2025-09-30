@@ -1,7 +1,12 @@
 # 🐸 Jiraiya Window Tiling Utility
 
 ## Introduction
-Jiraiya is a lightweight tiling assistant for Windows inspired by David Heinemeier Hansson's Omarchy Linux setup. It works alongside the operating system instead of fighting it: no exotic shell replacements, no hidden hacks, just tidy window placement across every monitor.
+Jiraiya [[2]](https://naruto.fandom.com/wiki/Jiraiya) is a lightweight tiling assistant for Windows inspired by David Heinemeier Hansson's Omarchy Linux setup. It works alongside the operating system instead of fighting it: no exotic shell replacements, no hidden hacks, just tidy window placement across every monitor.
+
+Jiraiya is also:
+
+- The toad-riding protagonist from the [Japanese folk tale](https://en.wikipedia.org/wiki/Jiraiya_(folklore)).
+- The legendary [Toad Sage](https://naruto.fandom.com/wiki/Jiraiya) of stupendous ninja skill from *Naruto*.
 
 ## How It Works
 - Launch Jiraiya and it immediately arranges the visible application windows into its three-slot layout (A, B, C) per monitor.
