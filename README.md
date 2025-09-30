@@ -11,7 +11,7 @@ Jiraiya is also:
 ## How It Works
 - Launch Jiraiya and it immediately arranges the visible application windows into its three-slot layout (A, B, C) per monitor.
 - It keeps listening for window events—new windows, closures, focus changes, moves—and reapplies the layout only when necessary.
-- Jiraiya runs headless and lives in the notification area. Press `Win + Alt + J` or use the tray menu to pause or resume the tiler; while paused, Windows behaves as if the tool were not running.
+- Jiraiya runs headless and lives in Windows tray area. Press `Win + Alt + J` or use the tray menu to pause or resume the tiler; while paused, Windows behaves as if the tool were not running.
 - The utility never overrides core Windows flows. You can still snap, resize, or move windows manually; Jiraiya simply automates the repetitive tiling work when it is enabled.
 
 ## Commands
