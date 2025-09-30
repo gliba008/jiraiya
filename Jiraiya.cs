@@ -71,12 +71,16 @@ class Program
     static NotifyIcon? _trayIcon;
     static ContextMenuStrip? _trayMenu;
     static ToolStripMenuItem? _toggleMenuItem;
+    static ToolStripMenuItem? _startupMenuItem;
     static string _configPath = string.Empty;
     static readonly HashSet<IntPtr> _minimizeSnapshot = new();
     static bool _minimizeSnapshotActive;
 #if DEBUG
     static StreamWriter? _debugLogWriter;
 #endif
+
+    const string StartupRunRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string StartupRunValueName = "Jiraiya";
 
     enum GridSlot { A, B, C }
     enum Direction { Left, Right, Up, Down }
@@ -1646,6 +1650,10 @@ class Program
         configItem.Click += (_, __) => OpenConfigFile();
         _trayMenu.Items.Add(configItem);
 
+        _startupMenuItem = new ToolStripMenuItem();
+        _startupMenuItem.Click += (_, __) => ToggleStartup();
+        _trayMenu.Items.Add(_startupMenuItem);
+
         var readmeItem = new ToolStripMenuItem("Readme");
         readmeItem.Click += (_, __) => OpenReadme();
         _trayMenu.Items.Add(readmeItem);
@@ -1677,6 +1685,7 @@ class Program
         };
 
         UpdateTrayToggleText();
+        UpdateStartupMenuItem();
     }
 
     static void UpdateTrayToggleText()
@@ -1698,6 +1707,118 @@ class Program
             {
                 _trayIcon.Text = "Jiraiya";
             }
+        }
+    }
+
+    static void UpdateStartupMenuItem()
+    {
+        if (_startupMenuItem == null)
+        {
+            return;
+        }
+
+        bool enabled = IsStartupEnabled();
+        string checkbox = enabled ? "☑️" : "⬜";
+        _startupMenuItem.Text = $"Start with Windows {checkbox}";
+    }
+
+    static void ToggleStartup()
+    {
+        bool targetState = !IsStartupEnabled();
+        if (!TrySetStartup(targetState, out string? errorMessage))
+        {
+            string message = targetState
+                ? "Failed to enable Start with Windows."
+                : "Failed to disable Start with Windows.";
+            if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                message += "\n\n" + errorMessage;
+            }
+
+            MessageBox.Show(message, GetAppTitle(), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+
+        UpdateStartupMenuItem();
+    }
+
+    static bool TrySetStartup(bool enable, out string? errorMessage)
+    {
+        errorMessage = null;
+        string? exePath = GetExecutablePath();
+        if (string.IsNullOrEmpty(exePath))
+        {
+            errorMessage = "Could not determine the executable path.";
+            return false;
+        }
+
+        try
+        {
+            using RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(StartupRunRegistryPath, writable: true)
+                ?? Registry.CurrentUser.CreateSubKey(StartupRunRegistryPath, true);
+
+            if (runKey == null)
+            {
+                errorMessage = "Failed to open the Run registry key.";
+                return false;
+            }
+
+            if (enable)
+            {
+                string command = $"\"{exePath}\"";
+                runKey.SetValue(StartupRunValueName, command, RegistryValueKind.String);
+            }
+            else
+            {
+                runKey.DeleteValue(StartupRunValueName, false);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            errorMessage = ex.Message;
+            return false;
+        }
+    }
+
+    static bool IsStartupEnabled()
+    {
+        try
+        {
+            using RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(StartupRunRegistryPath, writable: false);
+            if (runKey == null)
+            {
+                return false;
+            }
+
+            object? value = runKey.GetValue(StartupRunValueName);
+            if (value is null)
+            {
+                return false;
+            }
+
+            if (value is string stringValue && string.IsNullOrWhiteSpace(stringValue))
+            {
+                return false;
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static string? GetExecutablePath()
+    {
+        try
+        {
+            return Process.GetCurrentProcess().MainModule?.FileName;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -1755,7 +1876,7 @@ class Program
     {
         try
         {
-            string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
+            string? exePath = GetExecutablePath();
             if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
             {
                 Process.Start(new ProcessStartInfo
@@ -1794,6 +1915,7 @@ class Program
         _trayMenu?.Dispose();
         _trayMenu = null;
         _toggleMenuItem = null;
+        _startupMenuItem = null;
     }
 
     static string GetAppVersion()
