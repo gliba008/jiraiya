@@ -22,11 +22,11 @@ Jiraiya is a lightweight tiling assistant for Windows inspired by David Heinemei
 | Exit the utility | Tray menu → Exit | Right-click the tray icon (or left-click to pop the menu) and choose **Exit**. |
 
 ## Tray Menu
-- **Jiraiya vX.Y.Z** – read-only header showing the current build version.
-- **Enable/Disable tiling** – mirrors `Win + Alt + J`, toggling the tiler state.
+- **Enable/Disable tiling** – toggling if Jiraiya should work, mirrors `Win + Alt + J`.
+- **Enable/Disable start with Windows** – toggling if Jiraiya should start with Windows.
 - **Config…** – opens the active `config.json` in the system’s default editor (supports both local and root-level copies).
 - **Readme** – launches the online README at [github.com/gliba008/jiraiya](https://github.com/gliba008/jiraiya/blob/master/README.md).
-- **Exit** – closes the tiler and removes the tray icon.
+- **Exit** – closes Jiraiya.
 
 ## Configuration
 Jiraiya reads its settings from `config.json` in the application directory (the file is generated alongside the executable). A reference template with the default values lives in `config.default.json`; copy it when you want to reset or customise the configuration.
@@ -38,7 +38,7 @@ Jiraiya reads its settings from `config.json` in the application directory (the 
 | `center_ignored_windows` | `bool` | When `true`, ignored windows (apps or qualifying dialogs) are centred once when they appear. |
 | `debounce_in_ms` | `int` | Delay before the layout is recomputed after a window event. Use `120` for the default behaviour. |
 
-All settings are mandatory. If a value is missing or the file cannot be parsed, Jiraiya reports the configuration error in the console and exits, ensuring the tiler never runs with partially defined behaviour.
+All settings are mandatory. If a value is missing or the file cannot be parsed, Jiraiya reports the configuration error and exits, ensuring the tiler never runs with partially defined behaviour.
 
 ---
 Built with .NET and the Win32 API to keep your desktop orderly without breaking your Windows workflow.
