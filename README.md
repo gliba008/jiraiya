@@ -5,8 +5,8 @@ Jiraiya is a lightweight tiling assistant for Windows inspired by [David Heineme
 
 Jiraiya is also:
 
-- The legendary [Toad Sage](https://naruto.fandom.com/wiki/Jiraiya) of stupendous ninja skill from *Naruto*.
 - The toad-riding protagonist from the [Japanese folk tale](https://en.wikipedia.org/wiki/Jiraiya_(folklore)).
+- The legendary [Toad Sage](https://naruto.fandom.com/wiki/Jiraiya) of stupendous ninja skill from *Naruto*.
 
 ## How It Works
 - Launch Jiraiya and it immediately arranges the visible application windows into its three-slot layout (A, B, C) per monitor.
