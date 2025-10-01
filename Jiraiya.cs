@@ -1416,7 +1416,7 @@ class Program
 
         _fullscreenToggles[hwnd] = new FullscreenToggleState(monitor, windowRects, ordered);
 
-        RECT fullscreenRect = monitorInfo.rcMonitor;
+        RECT fullscreenRect = monitorInfo.rcWork;
         MoveWindowToRect(hwnd, fullscreenRect, "ALT+F11");
     }
 
