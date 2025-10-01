@@ -31,6 +31,8 @@ class Program
 {
     // --- Config ---
     const int DefaultDebounceMs = 120; // fallback debounce delay if config fails early
+    const byte FocusedWindowOpacity = 255;
+    const byte UnfocusedWindowOpacity = 245; // ~95%
 
     // WinEvent hooks
     static IntPtr _hookShowHide = IntPtr.Zero;
@@ -43,7 +45,8 @@ class Program
     static readonly Dictionary<IntPtr, List<IntPtr>> _orderedPerMonitor = new();
     static readonly List<IntPtr> _allMonitors = new();
     static IntPtr _focusedWindow = IntPtr.Zero;
-    static uint _accentArgb = 0xFF3388FF; // default fallback (ARGB)
+    static readonly HashSet<IntPtr> _opacityManagedWindows = new();
+    static readonly HashSet<IntPtr> _layeredStyleInjected = new();
     static bool _isActive = true;
 
     static readonly System.Timers.Timer _debounce = new(DefaultDebounceMs) { AutoReset = false, Enabled = false };
@@ -221,7 +224,6 @@ class Program
         ScanAllCandidates();
         ApplyAllLayouts();
 
-        LoadAccentColor();
         InstallKeyboardHook();
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         HandleForegroundChanged(GetForegroundWindow());
@@ -434,6 +436,7 @@ class Program
         {
             ApplyLayoutForMonitor(monitor);
         }
+        RefreshWindowOpacities();
     }
 
     static void ApplyLayoutForMonitor(IntPtr monitor)
@@ -494,7 +497,6 @@ class Program
             if (MonitorHasFullscreenWindow(monitor))
             {
                 Console.WriteLine("    ↳ fullscreen detected, skipping layout");
-                ReapplyFocusHighlight();
                 return;
             }
 
@@ -505,7 +507,6 @@ class Program
                 SetToRect(wins[i], rects[i], label);
             }
 
-            ReapplyFocusHighlight();
         }
         catch (Exception ex)
         {
@@ -1014,51 +1015,6 @@ class Program
                Math.Abs(a.bottom - b.bottom) <= Tolerance;
     }
 
-    static void LoadAccentColor()
-    {
-        if (TryGetExplorerAccent(out uint explorerArgb))
-        {
-            _accentArgb = explorerArgb | 0xFF000000;
-            return;
-        }
-
-        if (DwmGetColorizationColor(out uint argb, out bool _) == 0)
-        {
-            _accentArgb = argb | 0xFF000000;
-            return;
-        }
-
-        // default to calm blue if nothing else
-        _accentArgb = 0xFF1E90FF;
-    }
-
-    static bool TryGetExplorerAccent(out uint argb)
-    {
-        argb = 0;
-        try
-        {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent");
-            if (key == null) return false;
-
-            object? value = key.GetValue("AccentColorMenu") ?? key.GetValue("AccentColor");
-            if (value is int intVal)
-            {
-                argb = unchecked((uint)intVal);
-                return true;
-            }
-            if (value is uint uintVal)
-            {
-                argb = uintVal;
-                return true;
-            }
-        }
-        catch
-        {
-            // ignore issues, fall back to dwm/default color
-        }
-        return false;
-    }
-
     static void ToggleActive()
     {
         SetActive(!_isActive);
@@ -1074,7 +1030,6 @@ class Program
             Console.WriteLine("[i] Jiraiya resumed (Win+Alt+J)");
             ScanAllCandidates();
             ApplyAllLayouts();
-            ReapplyFocusHighlight();
             ShowStatusToast(true);
         }
         else
@@ -1093,24 +1048,6 @@ class Program
         DiscoverAllMonitors();
         ScanAllCandidates();
         ApplyAllLayouts();
-    }
-
-    static uint GetFocusBorderArgb()
-    {
-        uint argb = _accentArgb;
-        if ((argb & 0xFF000000) == 0)
-        {
-            argb |= 0xFF000000;
-        }
-        return argb;
-    }
-
-    static int ArgbToBgr(uint argb)
-    {
-        byte r = (byte)((argb >> 16) & 0xFF);
-        byte g = (byte)((argb >> 8) & 0xFF);
-        byte b = (byte)(argb & 0xFF);
-        return b | (g << 8) | (r << 16);
     }
 
     static void ShowStatusToast(bool enabled)
@@ -2786,7 +2723,6 @@ class Program
             if (_isActive)
             {
                 ApplyAllLayouts();
-                ReapplyFocusHighlight();
             }
         }
     }
@@ -2817,51 +2753,137 @@ class Program
     {
         if (!IsWindow(hwnd)) return;
 
-        if (_focusedWindow != IntPtr.Zero && _focusedWindow != hwnd && IsWindow(_focusedWindow))
-        {
-            ResetBorder(_focusedWindow);
-        }
-
         _focusedWindow = hwnd;
-        ApplyAccentBorder(_focusedWindow);
+        RefreshWindowOpacities();
     }
 
     static void ClearFocusHighlight()
     {
-        if (_focusedWindow != IntPtr.Zero && IsWindow(_focusedWindow))
-        {
-            ResetBorder(_focusedWindow);
-        }
         _focusedWindow = IntPtr.Zero;
+        RefreshWindowOpacities();
     }
 
-    static void ApplyAccentBorder(IntPtr hwnd)
+    static void RefreshWindowOpacities()
     {
-        if (!IsWindow(hwnd)) return;
-
-        uint accent = GetFocusBorderArgb();
-        int color = ArgbToBgr(accent);
-        int width = 4;
-        _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, ref color, sizeof(int));
-        _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_WIDTH, ref width, sizeof(int));
-    }
-
-    static void ResetBorder(IntPtr hwnd)
-    {
-        if (!IsWindow(hwnd)) return;
-
-        int defColor = DWMWA_COLOR_DEFAULT;
-        int width = 0;
-        _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, ref defColor, sizeof(int));
-        _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_WIDTH, ref width, sizeof(int));
-    }
-
-    static void ReapplyFocusHighlight()
-    {
-        if (_focusedWindow != IntPtr.Zero && IsWindow(_focusedWindow))
+        if (!_isActive)
         {
-            ApplyAccentBorder(_focusedWindow);
+            RestoreAllWindowOpacities();
+            return;
         }
+
+        bool hasFocused = _focusedWindow != IntPtr.Zero && IsWindow(_focusedWindow);
+        HashSet<IntPtr> current = new();
+
+        foreach (var hwnd in EnumerateManagedWindows())
+        {
+            if (!current.Add(hwnd)) continue;
+
+            byte targetAlpha = !hasFocused
+                ? FocusedWindowOpacity
+                : (hwnd == _focusedWindow ? FocusedWindowOpacity : UnfocusedWindowOpacity);
+
+            if (ApplyWindowOpacity(hwnd, targetAlpha))
+            {
+                _opacityManagedWindows.Add(hwnd);
+            }
+            else
+            {
+                _opacityManagedWindows.Remove(hwnd);
+                _layeredStyleInjected.Remove(hwnd);
+            }
+        }
+
+        foreach (var stale in _opacityManagedWindows.Where(h => !current.Contains(h)).ToList())
+        {
+            RestoreWindowOpacity(stale);
+        }
+    }
+
+    static IEnumerable<IntPtr> EnumerateManagedWindows()
+    {
+        HashSet<IntPtr> seen = new();
+        foreach (var windows in _orderedPerMonitor.Values)
+        {
+            foreach (var hwnd in windows)
+            {
+                if (!IsWindow(hwnd)) continue;
+                if (seen.Add(hwnd))
+                {
+                    yield return hwnd;
+                }
+            }
+        }
+    }
+
+    static bool ApplyWindowOpacity(IntPtr hwnd, byte alpha)
+    {
+        if (!IsWindow(hwnd))
+        {
+            return false;
+        }
+
+        long exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64();
+        bool hasLayered = (exStyle & WS_EX_LAYERED) != 0;
+        bool layeredInjected = false;
+
+        if (!hasLayered)
+        {
+            IntPtr previous = SetWindowLongPtr(hwnd, GWL_EXSTYLE, new IntPtr(exStyle | WS_EX_LAYERED));
+            int setError = Marshal.GetLastWin32Error();
+            if (previous == IntPtr.Zero && setError != 0)
+            {
+                return false;
+            }
+            layeredInjected = true;
+        }
+
+        if (!SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA))
+        {
+            int error = Marshal.GetLastWin32Error();
+            Console.WriteLine($"[!] Failed to set opacity (err={error}) hwnd=0x{hwnd.ToInt64():X}");
+
+            if (layeredInjected)
+            {
+                long currentStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64();
+                _ = SetWindowLongPtr(hwnd, GWL_EXSTYLE, new IntPtr(currentStyle & ~WS_EX_LAYERED));
+            }
+            return false;
+        }
+
+        if (layeredInjected)
+        {
+            _layeredStyleInjected.Add(hwnd);
+        }
+
+        return true;
+    }
+
+    static void RestoreWindowOpacity(IntPtr hwnd)
+    {
+        _opacityManagedWindows.Remove(hwnd);
+
+        if (!IsWindow(hwnd))
+        {
+            _layeredStyleInjected.Remove(hwnd);
+            return;
+        }
+
+        _ = SetLayeredWindowAttributes(hwnd, 0, FocusedWindowOpacity, LWA_ALPHA);
+
+        if (_layeredStyleInjected.Remove(hwnd))
+        {
+            long exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64();
+            _ = SetWindowLongPtr(hwnd, GWL_EXSTYLE, new IntPtr(exStyle & ~WS_EX_LAYERED));
+        }
+    }
+
+    static void RestoreAllWindowOpacities()
+    {
+        foreach (var hwnd in _opacityManagedWindows.ToList())
+        {
+            RestoreWindowOpacity(hwnd);
+        }
+        _opacityManagedWindows.Clear();
     }
     static bool DiscoverAllMonitors()
     {
@@ -2912,6 +2934,7 @@ class Program
 
         UninstallKeyboardHook();
         ClearFocusHighlight();
+        RestoreAllWindowOpacities();
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
 
         // Clean up tracking dictionaries
@@ -2946,11 +2969,9 @@ class Program
 
     const int GWL_STYLE = -16;
     const int GWL_EXSTYLE = -20;
+    const int WS_EX_LAYERED = 0x00080000;
 
     const int DWMWA_CLOAKED = 14;
-    const int DWMWA_BORDER_COLOR = 34;
-    const int DWMWA_BORDER_WIDTH = 35;
-    const int DWMWA_COLOR_DEFAULT = unchecked((int)0xFFFFFFFF);
 
     const uint SWP_NOSIZE = 0x0001;
     const uint SWP_NOZORDER = 0x0004;
@@ -2964,6 +2985,8 @@ class Program
     const int SW_SHOWMINIMIZED = 2;
     const int SW_MINIMIZE = 6;
     const int SW_RESTORE = 9;
+
+    const uint LWA_ALPHA = 0x00000002;
 
     const int WM_KEYDOWN = 0x0100;
     const int WM_KEYUP = 0x0101;
@@ -3025,10 +3048,10 @@ class Program
     static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
 
     [DllImport("user32.dll")] static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
 
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
-    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
-    [DllImport("dwmapi.dll")] static extern int DwmGetColorizationColor(out uint pcrColorization, out bool pfOpaqueBlend);
 
     [DllImport("user32.dll", SetLastError = true)] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
     delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
