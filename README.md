@@ -24,6 +24,8 @@ Jiraiya is also:
 | Reorder window vertically | `Win + Shift + Up / Down` | Shuffle the focused window inside the right-hand stack (top ↔ bottom). |
 | Move with the mouse | Drag a window | Drop a window onto the desired slot (A, B, C) to swap positions automatically. |
 | Minimise all tiled windows | `Win + Alt + M` | Minimise every managed window; press again (with all still minimised) to restore them in-place. |
+| Toggle fullscreen on the focused window | `Win + F` | Expand the focused window to fill the monitor while minimising its tiled peers; press again to restore the saved layout. |
+| Close the focused window | `Win + W` | Close the focused window without letting the default Windows shortcut fire; any fullscreen peers are restored first. |
 | Exit the utility | Tray menu → Exit | Right-click the tray icon (or left-click to pop the menu) and choose **Exit**. |
 
 ## Tray Menu

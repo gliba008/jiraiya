@@ -63,6 +63,7 @@ class Program
     static readonly HashSet<IntPtr> _programmaticMoveWindows = new();
     static IntPtr _draggingWindow = IntPtr.Zero;
     static int _activeWinKeyCode;
+    static int _pendingWinKeySuppression;
     static Icon? _appIcon;
     static readonly string _frogIconPath = Path.Combine(AppContext.BaseDirectory, "frog.ico");
     static readonly string _readmeUrl = "https://github.com/gliba008/jiraiya/blob/master/README.md";
@@ -91,16 +92,22 @@ class Program
 
     sealed class FullscreenToggleState
     {
-        public FullscreenToggleState(IntPtr monitor, Dictionary<IntPtr, RECT> windowRects, List<IntPtr> orderedHandles)
+        public FullscreenToggleState(
+            IntPtr monitor,
+            Dictionary<IntPtr, RECT> windowRects,
+            List<IntPtr> orderedHandles,
+            Dictionary<IntPtr, bool> windowWasIconic)
         {
             Monitor = monitor;
             WindowRects = windowRects;
             OrderedHandles = orderedHandles;
+            WindowWasIconic = windowWasIconic;
         }
 
         public IntPtr Monitor { get; }
         public Dictionary<IntPtr, RECT> WindowRects { get; }
         public List<IntPtr> OrderedHandles { get; }
+        public Dictionary<IntPtr, bool> WindowWasIconic { get; }
     }
 
     sealed class AppConfiguration
@@ -419,8 +426,13 @@ class Program
             foreach (var stale in state.WindowRects.Keys.Where(h => !IsWindow(h)).ToList())
             {
                 state.WindowRects.Remove(stale);
+                state.WindowWasIconic.Remove(stale);
             }
             state.OrderedHandles.RemoveAll(h => !IsWindow(h));
+            foreach (var stale in state.WindowWasIconic.Keys.Where(h => !IsWindow(h)).ToList())
+            {
+                state.WindowWasIconic.Remove(stale);
+            }
         }
 
         foreach (var staleIgnored in _ignoredWindows.Where(h => !enumeratedHandles.Contains(h)).ToList())
@@ -1242,6 +1254,7 @@ class Program
         _altComboInjected = false;
         _activeWinKeyCode = 0;
         _swallowedKeys.Clear();
+        _pendingWinKeySuppression = 0;
     }
 
     static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1290,10 +1303,19 @@ class Program
                     return (IntPtr)1;
                 }
 
-                if (_altPressed && key == Keys.F11)
+                if (_winPressed && key == Keys.F)
                 {
                     ToggleFullscreenForActiveWindow();
-                    _swallowedKeys.Add(info.vkCode);
+                    SwallowKey(info.vkCode);
+                    SwallowActiveWinKey();
+                    return (IntPtr)1;
+                }
+
+                if (_winPressed && key == Keys.W)
+                {
+                    CloseActiveWindow();
+                    SwallowKey(info.vkCode);
+                    SwallowActiveWinKey();
                     return (IntPtr)1;
                 }
 
@@ -1338,15 +1360,118 @@ class Program
                         break;
                 }
 
+                bool isInjected = (info.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) != 0;
+
+                if (_pendingWinKeySuppression != 0 && info.vkCode == _pendingWinKeySuppression)
+                {
+                    if (!isInjected)
+                    {
+                        _pendingWinKeySuppression = 0;
+                        return (IntPtr)1;
+                    }
+                }
+
                 if (_swallowedKeys.Contains(info.vkCode))
                 {
                     _swallowedKeys.Remove(info.vkCode);
-                    return (IntPtr)1;
+                    if (!isInjected)
+                    {
+                        return (IntPtr)1;
+                    }
                 }
             }
         }
 
         return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+    }
+
+    static void SwallowKey(int vkCode)
+    {
+        if (vkCode != 0)
+        {
+            _swallowedKeys.Add(vkCode);
+        }
+    }
+
+    static void SwallowActiveWinKey()
+    {
+        if (_activeWinKeyCode != 0)
+        {
+            _pendingWinKeySuppression = _activeWinKeyCode;
+            if (!InjectWinKeyUp(_activeWinKeyCode))
+            {
+                _pendingWinKeySuppression = 0;
+            }
+        }
+    }
+
+    static bool InjectWinKeyUp(int vkCode)
+    {
+        ushort vk = (ushort)vkCode;
+        if (vk != VK_LWIN && vk != VK_RWIN)
+        {
+            return false;
+        }
+
+        INPUT[] inputs = new INPUT[3];
+
+        inputs[0] = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            U = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = VK_CONTROL,
+                    wScan = 0,
+                    dwFlags = 0,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        inputs[1] = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            U = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = vk,
+                    wScan = 0,
+                    dwFlags = KEYEVENTF_KEYUP,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        inputs[2] = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            U = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = VK_CONTROL,
+                    wScan = 0,
+                    dwFlags = KEYEVENTF_KEYUP,
+                    time = 0,
+                    dwExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        if (sent != inputs.Length)
+        {
+            int error = Marshal.GetLastWin32Error();
+            Console.WriteLine($"[!] SendInput WinKeyUp failed (err={error}).");
+            return false;
+        }
+
+        return true;
     }
 
     static void ToggleFullscreenForActiveWindow()
@@ -1401,9 +1526,15 @@ class Program
         }
 
         var windowRects = new Dictionary<IntPtr, RECT>();
+        var windowWasIconic = new Dictionary<IntPtr, bool>();
         foreach (var win in ordered)
         {
-            if (IsWindow(win) && GetWindowRect(win, out RECT rect))
+            if (!IsWindow(win)) continue;
+
+            bool wasIconic = IsIconic(win);
+            windowWasIconic[win] = wasIconic;
+
+            if (GetWindowRect(win, out RECT rect))
             {
                 windowRects[win] = rect;
             }
@@ -1414,13 +1545,38 @@ class Program
             windowRects[hwnd] = currentRect;
         }
 
-        _fullscreenToggles[hwnd] = new FullscreenToggleState(monitor, windowRects, ordered);
+        _fullscreenToggles[hwnd] = new FullscreenToggleState(monitor, windowRects, ordered, windowWasIconic);
 
-        RECT fullscreenRect = monitorInfo.rcWork;
-        MoveWindowToRect(hwnd, fullscreenRect, "ALT+F11");
+        bool previousSuppress = _suppressMoveEvents;
+        _suppressMoveEvents = true;
+        try
+        {
+            foreach (var win in ordered)
+            {
+                if (win == hwnd) continue;
+                if (!IsWindow(win)) continue;
+
+                if (windowWasIconic.TryGetValue(win, out bool wasIconic) && !wasIconic && !IsIconic(win))
+                {
+                    ShowWindow(win, SW_MINIMIZE);
+                }
+            }
+
+            if (windowWasIconic.TryGetValue(hwnd, out bool targetWasIconic) && targetWasIconic && IsIconic(hwnd))
+            {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+
+            RECT fullscreenRect = monitorInfo.rcWork;
+            MoveWindowToRect(hwnd, fullscreenRect, "WIN+F");
+        }
+        finally
+        {
+            _suppressMoveEvents = previousSuppress;
+        }
     }
 
-    static void RestoreWindowFromToggle(IntPtr hwnd, FullscreenToggleState saved)
+    static void RestoreWindowFromToggle(IntPtr hwnd, FullscreenToggleState saved, bool restoreTarget = true)
     {
         bool previousSuppress = _suppressMoveEvents;
         _suppressMoveEvents = true;
@@ -1431,12 +1587,33 @@ class Program
                 IntPtr target = kv.Key;
                 if (target == hwnd) continue;
                 if (!IsWindow(target)) continue;
-                MoveWindowToRect(target, kv.Value, "ALT+F11 peer restore");
+
+                bool wasIconic = saved.WindowWasIconic.TryGetValue(target, out var value) && value;
+                if (wasIconic)
+                {
+                    continue;
+                }
+
+                if (IsIconic(target))
+                {
+                    ShowWindow(target, SW_RESTORE);
+                }
+
+                MoveWindowToRect(target, kv.Value, "WIN+F peer restore");
             }
 
             if (saved.WindowRects.TryGetValue(hwnd, out var selfRect) && IsWindow(hwnd))
             {
-                MoveWindowToRect(hwnd, selfRect, "ALT+F11 restore");
+                if (restoreTarget)
+                {
+                    bool selfWasIconic = saved.WindowWasIconic.TryGetValue(hwnd, out var value) && value;
+                    if (selfWasIconic && IsIconic(hwnd))
+                    {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    }
+
+                    MoveWindowToRect(hwnd, selfRect, "WIN+F restore");
+                }
             }
         }
         finally
@@ -1457,7 +1634,32 @@ class Program
             }
         }
 
-        FocusWindowOnMonitor(hwnd);
+        if (restoreTarget)
+        {
+            FocusWindowOnMonitor(hwnd);
+        }
+    }
+
+    static void CloseActiveWindow()
+    {
+        IntPtr hwnd = GetForegroundWindow();
+        if ((hwnd == IntPtr.Zero || !IsWindowValidForToggleTarget(hwnd)) && _focusedWindow != IntPtr.Zero)
+        {
+            hwnd = _focusedWindow;
+        }
+
+        if (!IsWindowValidForToggleTarget(hwnd))
+        {
+            return;
+        }
+
+        if (_fullscreenToggles.TryGetValue(hwnd, out var saved))
+        {
+            RestoreWindowFromToggle(hwnd, saved, restoreTarget: false);
+        }
+
+        _fullscreenToggles.Remove(hwnd);
+        _ = PostMessage(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
     }
 
     static bool IsWindowValidForToggleTarget(IntPtr hwnd)
@@ -2992,12 +3194,17 @@ class Program
     const int WM_KEYUP = 0x0101;
     const int WM_SYSKEYDOWN = 0x0104;
     const int WM_SYSKEYUP = 0x0105;
+    const uint WM_CLOSE = 0x0010;
 
     const int WH_KEYBOARD_LL = 13;
 
     const uint INPUT_KEYBOARD = 1;
     const uint KEYEVENTF_KEYUP = 0x0002;
     const ushort VK_CONTROL = 0x11;
+    const ushort VK_LWIN = 0x5B;
+    const ushort VK_RWIN = 0x5C;
+    const int LLKHF_LOWER_IL_INJECTED = 0x00000002;
+    const int LLKHF_INJECTED = 0x00000010;
 
     static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new(-4);
     const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -3020,6 +3227,7 @@ class Program
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
