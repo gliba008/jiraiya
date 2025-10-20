@@ -1296,14 +1296,14 @@ class Program
                     return (IntPtr)1;
                 }
 
-                if (_winPressed && _altPressed && key == Keys.M)
+                if (_isActive && _winPressed && _altPressed && key == Keys.M)
                 {
                     ToggleMinimizeManagedWindows();
                     _swallowedKeys.Add(info.vkCode);
                     return (IntPtr)1;
                 }
 
-                if (_winPressed && key == Keys.F)
+                if (_isActive && _winPressed && key == Keys.F)
                 {
                     ToggleFullscreenForActiveWindow();
                     SwallowKey(info.vkCode);
@@ -1311,7 +1311,7 @@ class Program
                     return (IntPtr)1;
                 }
 
-                if (_winPressed && key == Keys.W)
+                if (_isActive && _winPressed && key == Keys.W)
                 {
                     CloseActiveWindow();
                     SwallowKey(info.vkCode);
